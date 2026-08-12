@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vitalstream-config-service"
+version = "0.1.0"
+description = "Versioned feature-algo config: validate / gray release / rollback (PRD 3.1/4.2)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "pydantic-settings>=2.3",
+    "vitalstream-common",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "httpx>=0.27", "ruff>=0.5"]
+
+[tool.uv.sources]
+vitalstream-common = { path = "../../libs/common", editable = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/config_service"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP"]

@@ -1,0 +1,100 @@
+name: vitalstream
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    volumes: ["redis_data:/data"]
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on: [zookeeper]
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+
+  postgres:
+    image: postgres:16-alpine
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_USER: vitalstream
+      POSTGRES_PASSWORD: vitalstream
+      POSTGRES_DB: vitalstream
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    ports: ["5433:5432"]
+    environment:
+      POSTGRES_USER: vitalstream
+      POSTGRES_PASSWORD: vitalstream
+      POSTGRES_DB: vitalstream_timeseries
+    volumes: ["timescale_data:/var/lib/postgresql/data"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports: ["9090:9090"]
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:latest
+    ports: ["3001:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes: ["grafana_data:/var/lib/grafana"]
+
+  # Application services build from local Dockerfiles once implemented.
+  # Each builds with the repo root as context so it can COPY libs/common.
+  # Uncomment as each service becomes runnable.
+  #
+  # ingestion:
+  #   build: { context: ., dockerfile: services/ingestion/Dockerfile }
+  #   env_file: .env
+  #   ports: ["8001:8001"]
+  #   depends_on: [kafka]
+  #
+  # feature_extraction:
+  #   build: { context: ., dockerfile: services/feature_extraction/Dockerfile }
+  #   env_file: .env
+  #   depends_on: [kafka, timescaledb]
+  #
+  # config_service:
+  #   build: { context: ., dockerfile: services/config_service/Dockerfile }
+  #   env_file: .env
+  #   ports: ["8002:8002"]
+  #   depends_on: [postgres]
+  #
+  # insight_service:
+  #   build: { context: ., dockerfile: services/insight_service/Dockerfile }
+  #   env_file: .env
+  #   ports: ["8003:8003"]
+  #   depends_on: [redis]
+  #
+  # api:
+  #   build: { context: ., dockerfile: services/api/Dockerfile }
+  #   env_file: .env
+  #   ports: ["8000:8000"]
+  #   depends_on: [postgres, insight_service]
+  #
+  # frontend:
+  #   build: ./frontend
+  #   ports: ["3000:3000"]
+  #   depends_on: [api]
+
+volumes:
+  redis_data:
+  postgres_data:
+  timescale_data:
+  grafana_data:
