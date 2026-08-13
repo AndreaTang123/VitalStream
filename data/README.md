@@ -23,9 +23,8 @@ cloud VM, `git clone` the repo there, and run the script (or
 `infra/cloud/bootstrap_vm.sh`, which does both) directly on it. See
 [infra/cloud/bootstrap_vm.sh](../infra/cloud/bootstrap_vm.sh).
 
-The script requires bash 4+ (associative arrays) and `unzip`, both standard
-on any Ubuntu cloud image; macOS ships bash 3.2, so don't expect it to run
-under the default `/bin/bash` on a Mac.
+The script only needs `bash`, `curl`, and `unzip` — no bash 4+ features — so
+it runs the same on macOS's stock `/bin/bash` (3.2) as on an Ubuntu cloud VM.
 
 Raw and processed data are gitignored (`data/raw/`, `data/processed/`) — never
 commit dataset files to the repo.

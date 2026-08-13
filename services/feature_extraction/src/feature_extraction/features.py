@@ -10,8 +10,57 @@ from __future__ import annotations
 
 import numpy as np
 from scipy import stats
+from scipy.signal import butter, filtfilt, find_peaks
 
 ALGO_VERSION_V1 = "v1"
+
+# Bandpass range in Hz (36-150 bpm) and a per-window prominence threshold for
+# find_peaks. Both were tuned against real PPG-DaLiA data, not guessed: a
+# wider/higher band (e.g. up to 4 Hz / 240 bpm, the naive "human HR range")
+# lets the dicrotic notch on the downslope of each PPG pulse register as its
+# own peak, roughly doubling the detected peak count and the resulting bpm
+# estimate — see services/feature_extraction/scripts/validate_ppg_dalia.py
+# (week1-2-layer1-guide.md Step 6), which caught this via a ~37 bpm MAE
+# against ground truth before it was tightened down to ~8 bpm.
+_HR_BAND_LOW_HZ = 0.6  # 36 bpm
+_HR_BAND_HIGH_HZ = 2.5  # 150 bpm
+_PEAK_PROMINENCE_FRACTION = 0.4  # of the filtered window's stddev
+
+
+def bandpass_filter_ppg(values: np.ndarray, sample_rate_hz: float, order: int = 3) -> np.ndarray:
+    """Zero-phase Butterworth bandpass isolating the cardiac component of a PPG signal."""
+    if values.size == 0:
+        raise ValueError("values window is empty")
+    nyquist = sample_rate_hz / 2.0
+    b, a = butter(order, [_HR_BAND_LOW_HZ / nyquist, _HR_BAND_HIGH_HZ / nyquist], btype="band")
+    padlen = 3 * (max(len(a), len(b)) - 1)
+    if values.size <= padlen:
+        raise ValueError(
+            f"window of {values.size} samples too short to filtfilt (need > {padlen})"
+        )
+    return filtfilt(b, a, values)
+
+
+def heart_rate_from_ppg(values: np.ndarray, sample_rate_hz: float) -> float:
+    """Instantaneous heart rate (bpm) from a raw PPG window via peak-interval detection.
+
+    Bandpass-filters the window, finds systolic peaks at least one
+    plausible-heartbeat apart, and returns 60 / mean(peak-to-peak interval).
+    """
+    filtered = bandpass_filter_ppg(values, sample_rate_hz)
+    # Minimum samples between peaks at the fastest plausible heart rate (_HR_BAND_HIGH_HZ).
+    min_distance_samples = max(int(sample_rate_hz / _HR_BAND_HIGH_HZ), 1)
+    peaks, _ = find_peaks(
+        filtered,
+        distance=min_distance_samples,
+        prominence=_PEAK_PROMINENCE_FRACTION * float(np.std(filtered)),
+    )
+    if peaks.size < 2:
+        raise ValueError("not enough peaks detected to compute a heart rate")
+
+    peak_intervals_s = np.diff(peaks) / sample_rate_hz
+    mean_interval_s = float(np.mean(peak_intervals_s))
+    return 60.0 / mean_interval_s
 
 
 def resting_heart_rate(heart_rate_bpm: np.ndarray, low_percentile: float = 10.0) -> float:

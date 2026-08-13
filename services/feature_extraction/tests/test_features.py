@@ -1,7 +1,30 @@
 import numpy as np
 import pytest
 
-from feature_extraction.features import hrv_rmssd, resting_heart_rate, sleep_quality_score
+from feature_extraction.features import (
+    heart_rate_from_ppg,
+    hrv_rmssd,
+    resting_heart_rate,
+    sleep_quality_score,
+)
+
+
+def _synthetic_ppg(bpm: float, duration_s: float = 8.0, fs: float = 64.0, seed: int = 0) -> np.ndarray:
+    t = np.arange(0, duration_s, 1 / fs)
+    freq_hz = bpm / 60.0
+    noise = 0.05 * np.random.default_rng(seed).standard_normal(t.size)
+    return np.sin(2 * np.pi * freq_hz * t) + 0.3 * np.sin(2 * np.pi * 2 * freq_hz * t) + noise
+
+
+@pytest.mark.parametrize("bpm", [50.0, 72.0, 110.0])
+def test_heart_rate_from_ppg_recovers_known_bpm(bpm):
+    estimate = heart_rate_from_ppg(_synthetic_ppg(bpm), sample_rate_hz=64.0)
+    assert estimate == pytest.approx(bpm, abs=3.0)
+
+
+def test_heart_rate_from_ppg_rejects_too_short_window():
+    with pytest.raises(ValueError):
+        heart_rate_from_ppg(np.array([0.1, 0.2, 0.3]), sample_rate_hz=64.0)
 
 
 def test_resting_heart_rate_uses_low_percentile():

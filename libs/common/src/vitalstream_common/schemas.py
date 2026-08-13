@@ -26,10 +26,16 @@ class DeviceStatus(StrEnum):
 
 
 class SignalType(StrEnum):
-    HEART_RATE = "heart_rate"
-    HRV = "hrv"
-    SLEEP = "sleep"
-    ACTIVITY = "activity"
+    """Raw wearable sensor channels (PRD 3.1: "原始信号窗口化处理为结构化特征").
+
+    Distinct from `Feature.feature_type` (e.g. "heart_rate"), which is a
+    *derived* metric computed from one or more of these raw channels.
+    """
+
+    PPG = "ppg"
+    ECG = "ecg"
+    ACC = "acc"
+    EDA = "eda"
 
 
 class ConfigVersionStatus(StrEnum):
@@ -53,11 +59,20 @@ class Device(BaseModel):
     status: DeviceStatus
 
 
-class RawSignal(BaseModel):
+class SignalBatch(BaseModel):
+    """A chunk of raw waveform samples from one device/channel (PRD 3.1/4.5 ingest contract).
+
+    `start_ts` is the unix timestamp of `values[0]`; subsequent samples are
+    spaced `1 / sample_rate_hz` seconds apart. Devices report in batches
+    (e.g. one second of samples at a time) rather than one message per
+    sample, so ingestion can do a single Kafka write per HTTP request.
+    """
+
     device_id: UUID
     signal_type: SignalType
-    value: float
-    timestamp: datetime
+    sample_rate_hz: float
+    start_ts: float
+    values: list[float]
 
 
 class Feature(BaseModel):

@@ -1,4 +1,4 @@
-PY_SERVICES := libs/common services/ingestion services/feature_extraction services/config_service services/insight_service services/api
+PY_SERVICES := libs/common services/ingestion services/feature_extraction services/config_service services/insight_service services/api services/device_simulator
 
 .PHONY: bootstrap test lint fmt up down frontend-install frontend-dev download-data
 

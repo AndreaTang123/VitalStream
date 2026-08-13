@@ -1,27 +1,31 @@
 """Layer 1 ingestion service entrypoint (PRD 3.1 / 4.5).
 
-Accepts high-frequency wearable signals over HTTP (batch POST) and WebSocket
-(continuous stream), and forwards them to Kafka for downstream buffering and
-feature extraction. Runs under uvloop for lower event-loop overhead.
+Accepts batches of raw wearable waveform samples over HTTP and forwards them
+to Kafka for downstream buffering and feature extraction. Runs under uvloop
+for lower event-loop overhead.
+
+WebSocket streaming is deliberately deferred (week1-2-layer1-guide.md): HTTP
+POST is easier to test end-to-end first; a long-lived stream endpoint is a
+Week 3+ addition once the batch path is proven.
 """
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime
 from uuid import UUID
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI
 from pydantic import BaseModel
-from vitalstream_common.schemas import RawSignal, SignalType
+from vitalstream_common.schemas import SignalBatch, SignalType
 
 from ingestion.kafka_producer import producer
 
 
-class SignalIn(BaseModel):
+class SignalBatchIn(BaseModel):
     signal_type: SignalType
-    value: float
-    timestamp: datetime
+    sample_rate_hz: float
+    start_ts: float
+    values: list[float]
 
 
 @asynccontextmanager
@@ -34,23 +38,10 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="vitalstream-ingestion", lifespan=lifespan)
 
 
-@app.post("/api/v1/devices/{device_id}/signals")
-async def ingest_signals(device_id: UUID, signals: list[SignalIn]) -> dict:
-    for signal in signals:
-        await producer.send(RawSignal(device_id=device_id, **signal.model_dump()))
-    return {"accepted": len(signals)}
-
-
-@app.websocket("/api/v1/devices/{device_id}/signals/stream")
-async def ingest_signals_stream(websocket: WebSocket, device_id: UUID) -> None:
-    await websocket.accept()
-    try:
-        while True:
-            payload = await websocket.receive_json()
-            signal_in = SignalIn.model_validate(payload)
-            await producer.send(RawSignal(device_id=device_id, **signal_in.model_dump()))
-    except Exception:
-        await websocket.close()
+@app.post("/api/v1/devices/{device_id}/signals", status_code=202)
+async def ingest_signal_batch(device_id: UUID, batch: SignalBatchIn) -> dict:
+    await producer.send(SignalBatch(device_id=device_id, **batch.model_dump()))
+    return {"accepted": len(batch.values)}
 
 
 @app.get("/healthz")

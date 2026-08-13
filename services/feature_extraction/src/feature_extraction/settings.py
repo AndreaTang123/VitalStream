@@ -9,6 +9,9 @@ class Settings(BaseSettings):
     features_topic: str = "features"
     consumer_group_id: str = "feature-extraction"
     config_service_base_url: str = "http://localhost:8002"
+    # Plain Postgres for the `features` table (week1-2-layer1-guide.md Step 7).
+    postgres_dsn: str = "postgresql+asyncpg://vitalstream:vitalstream@localhost:5432/vitalstream"
+    # TimescaleDB hypertable for raw signal storage — Week 3+ (PRD 4.1), unused for now.
     timescale_dsn: str = "postgresql+asyncpg://vitalstream:vitalstream@localhost:5433/vitalstream_timeseries"
 
 

@@ -4,8 +4,9 @@ from vitalstream_common.schemas import (
     Device,
     Feature,
     Insight,
-    RawSignal,
     Role,
+    SignalBatch,
+    SignalType,
     User,
 )
 
@@ -15,7 +16,8 @@ __all__ = [
     "Device",
     "Feature",
     "Insight",
-    "RawSignal",
     "Role",
+    "SignalBatch",
+    "SignalType",
     "User",
 ]

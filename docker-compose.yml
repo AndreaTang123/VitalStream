@@ -6,23 +6,24 @@ services:
     ports: ["6379:6379"]
     volumes: ["redis_data:/data"]
 
-  kafka:
-    image: confluentinc/cp-kafka:7.6.0
-    depends_on: [zookeeper]
-    ports: ["9092:9092"]
-    environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.6.0
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
+  # Kafka-protocol broker for raw-signals/features (week1-2-layer1-guide.md
+  # decision: Redpanda over Kafka+ZooKeeper — one container, same wire
+  # protocol, so aiokafka clients don't know or care. Swap to a real Kafka
+  # broker later if needed; nothing downstream is coupled to Redpanda itself.
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092,PLAINTEXT_HOST://localhost:29092
+    ports: ["29092:29092", "9644:9644"]
+    volumes: ["redpanda_data:/var/lib/redpanda/data"]
 
   postgres:
     image: postgres:16-alpine
@@ -63,12 +64,12 @@ services:
   #   build: { context: ., dockerfile: services/ingestion/Dockerfile }
   #   env_file: .env
   #   ports: ["8001:8001"]
-  #   depends_on: [kafka]
+  #   depends_on: [redpanda]
   #
   # feature_extraction:
   #   build: { context: ., dockerfile: services/feature_extraction/Dockerfile }
   #   env_file: .env
-  #   depends_on: [kafka, timescaledb]
+  #   depends_on: [redpanda, postgres]
   #
   # config_service:
   #   build: { context: ., dockerfile: services/config_service/Dockerfile }
@@ -95,6 +96,7 @@ services:
 
 volumes:
   redis_data:
+  redpanda_data:
   postgres_data:
   timescale_data:
   grafana_data:

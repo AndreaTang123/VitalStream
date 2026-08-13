@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 
 from aiokafka import AIOKafkaProducer
-from vitalstream_common.schemas import RawSignal
+from vitalstream_common.schemas import SignalBatch
 
 from ingestion.config import settings
 
@@ -31,13 +31,13 @@ class SignalProducer:
         if self._producer is not None:
             await self._producer.stop()
 
-    async def send(self, signal: RawSignal) -> None:
+    async def send(self, batch: SignalBatch) -> None:
         if self._producer is None:
             raise RuntimeError("SignalProducer.start() must be called before send()")
         await self._producer.send_and_wait(
             settings.raw_signals_topic,
-            value=signal.model_dump(mode="json"),
-            key=str(signal.device_id).encode("utf-8"),
+            value=batch.model_dump(mode="json"),
+            key=str(batch.device_id).encode("utf-8"),
         )
 
 
