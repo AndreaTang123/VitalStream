@@ -69,6 +69,13 @@ make bootstrap                # create venvs and install each Python service in 
 make test                     # run all service test suites
 ```
 
+Datasets (WESAD, PPG-DaLiA) are *not* fetched by the steps above — they're
+only needed once a service actually replays them, so they're downloaded
+directly on whichever machine runs `docker compose up`. On a fresh cloud VM,
+[infra/cloud/bootstrap_vm.sh](infra/cloud/bootstrap_vm.sh) does the whole
+thing (install Docker, clone this repo, `data/scripts/download_datasets.sh`,
+`docker compose up -d`) in one shot. See [data/README.md](data/README.md).
+
 Each service under `services/*` is an independently installable Python package
 (`pip install -e .`) with its own `pyproject.toml` and `Dockerfile`, so it can run
 standalone or as part of `docker compose`. See each service's README for endpoints

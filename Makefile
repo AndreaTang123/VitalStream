@@ -1,6 +1,6 @@
 PY_SERVICES := libs/common services/ingestion services/feature_extraction services/config_service services/insight_service services/api
 
-.PHONY: bootstrap test lint fmt up down frontend-install frontend-dev
+.PHONY: bootstrap test lint fmt up down frontend-install frontend-dev download-data
 
 bootstrap:
 	@for svc in $(PY_SERVICES); do \
@@ -32,6 +32,9 @@ up:
 
 down:
 	docker compose down
+
+download-data:
+	./data/scripts/download_datasets.sh
 
 frontend-install:
 	cd frontend && npm install
