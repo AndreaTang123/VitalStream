@@ -13,6 +13,7 @@ dependencies = [
     "uvloop>=0.19",
     "aiokafka>=0.11",
     "pydantic-settings>=2.3",
+    "opentelemetry-instrumentation-fastapi>=0.46b0",
     "vitalstream-common",
 ]
 

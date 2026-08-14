@@ -43,6 +43,16 @@ services:
       POSTGRES_DB: vitalstream_timeseries
     volumes: ["timescale_data:/var/lib/postgresql/data"]
 
+  # Local trace viewer (week3-layer1-deepening-guide.md Step 5) — Jaeger's
+  # all-in-one image, not Tempo/Grafana Cloud, so there's no extra account
+  # setup this week. OTLP receiver matches .env.example's
+  # OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318.
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports: ["16686:16686", "4317:4317", "4318:4318"]
+
   prometheus:
     image: prom/prometheus:latest
     ports: ["9090:9090"]

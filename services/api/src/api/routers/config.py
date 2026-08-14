@@ -30,7 +30,9 @@ async def publish_canary(
     session: AsyncSession = Depends(get_db),
 ) -> dict:
     async with httpx.AsyncClient(base_url=settings.config_service_base_url, timeout=10.0) as client:
-        response = await client.post("/api/v1/config/feature-algo", json=body.model_dump())
+        response = await client.post(
+            "/api/v1/config/feature-algo", json={**body.model_dump(), "actor": current_user.email}
+        )
     response.raise_for_status()
 
     await write_audit_log(
@@ -50,7 +52,10 @@ async def rollback(
     session: AsyncSession = Depends(get_db),
 ) -> dict:
     async with httpx.AsyncClient(base_url=settings.config_service_base_url, timeout=10.0) as client:
-        response = await client.post(f"/api/v1/config/feature-algo/{algo_name}/{version}/rollback")
+        response = await client.post(
+            f"/api/v1/config/feature-algo/{algo_name}/{version}/rollback",
+            json={"actor": current_user.email},
+        )
     response.raise_for_status()
 
     await write_audit_log(

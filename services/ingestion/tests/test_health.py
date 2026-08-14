@@ -10,4 +10,6 @@ def test_healthz():
     response = client.get("/healthz")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["event_loop"]  # non-empty: proves the handler ran on a real loop

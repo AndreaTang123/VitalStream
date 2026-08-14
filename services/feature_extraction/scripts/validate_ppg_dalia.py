@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from feature_extraction.features import heart_rate_from_ppg
+from feature_extraction.features import HEART_RATE_ALGORITHMS
 from feature_extraction.main import STEP_SECONDS, WINDOW_SECONDS
 
 BVP_SAMPLE_RATE_HZ = 64.0
@@ -30,9 +30,10 @@ def load_subject(data_dir: Path, subject: str) -> dict:
         return pickle.load(f, encoding="latin1")
 
 
-def estimate_hr_series(bvp: np.ndarray, n_windows: int) -> np.ndarray:
+def estimate_hr_series(bvp: np.ndarray, n_windows: int, algo_version: str) -> np.ndarray:
     """One heart-rate estimate per ground-truth window, aligned to PPG-DaLiA's
     own (WINDOW_SECONDS, STEP_SECONDS) convention starting at t=0."""
+    algo_fn = HEART_RATE_ALGORITHMS[algo_version]
     window_samples = int(WINDOW_SECONDS * BVP_SAMPLE_RATE_HZ)
     step_samples = int(STEP_SECONDS * BVP_SAMPLE_RATE_HZ)
     estimates = np.full(n_windows, np.nan)
@@ -43,7 +44,7 @@ def estimate_hr_series(bvp: np.ndarray, n_windows: int) -> np.ndarray:
         if len(window) < window_samples:
             break
         try:
-            estimates[i] = heart_rate_from_ppg(window, BVP_SAMPLE_RATE_HZ)
+            estimates[i] = algo_fn(window, BVP_SAMPLE_RATE_HZ)
         except ValueError:
             continue  # not enough peaks in this window — leave as NaN, counted against coverage
 
@@ -83,6 +84,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--subject", default="S2")
     parser.add_argument("--data-dir", default=None, help="defaults to <repo root>/data/raw/ppg_dalia/PPG_FieldStudy")
+    parser.add_argument(
+        "--algo-version",
+        default="v1",
+        choices=sorted(HEART_RATE_ALGORITHMS),
+        help="which HEART_RATE_ALGORITHMS entry to validate — e.g. v2-naive-wideband "
+        "reproduces the week3 gray-release demo's deliberately-bad canary",
+    )
     parser.add_argument("--plot", action="store_true", help="save an estimate-vs-ground-truth PNG")
     args = parser.parse_args()
 
@@ -91,12 +99,12 @@ def main() -> None:
     bvp = data["signal"]["wrist"]["BVP"].reshape(-1)
     ground_truth = data["label"].reshape(-1)
 
-    estimates = estimate_hr_series(bvp, n_windows=len(ground_truth))
+    estimates = estimate_hr_series(bvp, n_windows=len(ground_truth), algo_version=args.algo_version)
     valid = ~np.isnan(estimates)
     mae = float(np.mean(np.abs(estimates[valid] - ground_truth[valid])))
     coverage = valid.sum() / len(ground_truth)
 
-    print(f"subject={args.subject} windows={len(ground_truth)} coverage={coverage:.1%}")
+    print(f"subject={args.subject} algo_version={args.algo_version} windows={len(ground_truth)} coverage={coverage:.1%}")
     print(f"MAE = {mae:.2f} bpm")
 
     if args.plot:

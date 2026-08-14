@@ -90,6 +90,7 @@ subject's data is under `data/raw/ppg_dalia/PPG_FieldStudy/` (see
 [data/README.md](data/README.md)), run each of these in its own terminal:
 
 ```bash
+services/config_service/.venv/bin/uvicorn config_service.main:app --app-dir services/config_service/src --port 8002
 services/ingestion/.venv/bin/python -m ingestion.run
 services/feature_extraction/.venv/bin/python -m feature_extraction.main
 services/device_simulator/.venv/bin/python -m device_simulator.replay --subject S2
@@ -113,14 +114,91 @@ services/feature_extraction/.venv/bin/python \
   services/feature_extraction/scripts/validate_ppg_dalia.py --subject S2 --plot
 ```
 
+### Config management & gray release
+
+`config_service` owns algorithm version state in Postgres (`algo_versions` +
+`algo_version_audit` — every register/canary/promote/rollback call is
+audited with an actor, action, and timestamp) and exposes it over HTTP.
+`feature_extraction` polls `GET .../active` into an in-memory cache every 30s
+(`CONFIG_REFRESH_INTERVAL_SECONDS` in `main.py`) rather than on every
+message, and routes each *device* to a version by hashing its `device_id`
+mod 100 against the canary's `rollout_pct` — so a given device stays on the
+same version for the life of a rollout instead of flip-flopping per message.
+
+```bash
+# register the first stable version
+curl -X POST localhost:8002/api/v1/config/feature-algo/register-stable \
+  -d '{"algo_name":"heart_rate","version":"v1","actor":"you"}'
+
+# gray-release a second version to 20% of devices
+curl -X POST localhost:8002/api/v1/config/feature-algo \
+  -d '{"algo_name":"heart_rate","version":"v2-naive-wideband","rollout_pct":20,"actor":"you"}'
+
+# looks good? promote it to 100%
+curl -X POST localhost:8002/api/v1/config/feature-algo/heart_rate/promote -d '{"actor":"you"}'
+
+# looks bad? roll it back — works whether it's still a canary or already
+# promoted to active (restores the previous version in the latter case)
+curl -X POST localhost:8002/api/v1/config/feature-algo/heart_rate/v2-naive-wideband/rollback -d '{"actor":"you"}'
+
+# who did what, when
+curl localhost:8002/api/v1/config/feature-algo/heart_rate/audit-log
+```
+
+`features.HEART_RATE_ALGORITHMS` maps a version string to an actual
+implementation — `v1` is the tuned algorithm, `v2-naive-wideband` is a real
+(not synthetic) bad version: the pre-tuning parameters that scored ~37 bpm
+MAE in `validate_ppg_dalia.py` before being fixed to ~8 bpm. Publishing it as
+a canary and rolling it back is a genuine "ship a regression, catch it,
+revert it" exercise, not a no-op toggle.
+
+### Observability (tracing)
+
+`docker compose up -d` includes Jaeger (`jaegertracing/all-in-one`) — UI at
+[localhost:16686](http://localhost:16686). `ingestion` and
+`feature_extraction` both call `vitalstream_common.telemetry.configure_tracing()`
+and export spans via OTLP/HTTP to Jaeger. The interesting part isn't the
+per-service spans (FastAPI is auto-instrumented) — it's that they're all
+*one trace* across two processes: `ingestion.kafka_producer` injects the
+current span's W3C trace context into the outgoing Kafka message's headers,
+and `feature_extraction.main`'s consumer loop extracts it back out and
+continues the same trace instead of starting a new one. Search for any
+recent trace under service `ingestion` and you'll see:
+
+```
+POST /api/v1/devices/{id}/signals   (ingestion, HTTP)
+└─ consume raw-signal               (feature_extraction, Kafka)
+   ├─ compute feature (bandpass+peaks)
+   ├─ produce features-topic
+   └─ write features row (postgres)
+```
+
+one span per stage from device upload to DB write, with real per-stage
+latency (typically: Postgres write and Kafka produce dominate; the actual
+signal-processing math is comparatively cheap).
+
 ## Status
 
-Layer 1 (PRD milestone: Week 1-2) is working end-to-end: the device simulator
-replays real PPG-DaLiA wrist-BVP data over HTTP, ingestion batches it onto
-Redpanda, and feature_extraction derives heart rate via a bandpass-filter +
-peak-detection pipeline (tuned against ground truth — see
-`validate_ppg_dalia.py`; naive parameters produced a ~37 bpm MAE from
-picking up the PPG dicrotic notch as a second peak per beat, tightened to
-~8 bpm), persisting `Feature` rows to Postgres. Layers 2-3 (LLM insights,
-full-stack delivery) are still scaffolds — see [docs/PRD.md](docs/PRD.md)
-section 7 for the milestone plan.
+Layer 1 (PRD milestones: Week 1-2 + Week 3) is working end-to-end and
+load-tested:
+
+- **Week 1-2**: the device simulator replays real PPG-DaLiA wrist-BVP data
+  over HTTP, ingestion batches it onto Redpanda, and feature_extraction
+  derives heart rate via a bandpass-filter + peak-detection pipeline (tuned
+  against ground truth — see `validate_ppg_dalia.py`; naive parameters
+  produced a ~37 bpm MAE from picking up the PPG dicrotic notch as a second
+  peak per beat, tightened to ~8 bpm), persisting `Feature` rows to Postgres.
+- **Week 3**: `config_service` gray-releases feature-algo versions (Postgres-
+  backed, audited, hash-bucketed per device — live-verified: a 20% canary
+  landed in exactly 20/100 devices' feature rows, and rollback dropped that
+  to 0/100 within one 30s cache-refresh cycle); a full ingestion→Kafka→
+  feature_extraction→Postgres trace is visible in Jaeger; and benchmarking
+  ingestion found a real bug (the producer was blocking each HTTP response on
+  a full Kafka ack, not just returning 202 immediately) — fixing it measured
+  ~4.8x throughput / ~6.5x P50 latency at fixed concurrency. See
+  [benchmarks/results.md](benchmarks/results.md) for the full methodology,
+  including a couple of benchmarking dead ends worth knowing about before
+  trusting any throughput number on this stack.
+
+Layers 2-3 (LLM insights, full-stack delivery) are still scaffolds — see
+[docs/PRD.md](docs/PRD.md) section 7 for the milestone plan.

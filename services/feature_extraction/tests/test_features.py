@@ -3,6 +3,7 @@ import pytest
 
 from feature_extraction.features import (
     heart_rate_from_ppg,
+    heart_rate_from_ppg_v2_naive,
     hrv_rmssd,
     resting_heart_rate,
     sleep_quality_score,
@@ -25,6 +26,17 @@ def test_heart_rate_from_ppg_recovers_known_bpm(bpm):
 def test_heart_rate_from_ppg_rejects_too_short_window():
     with pytest.raises(ValueError):
         heart_rate_from_ppg(np.array([0.1, 0.2, 0.3]), sample_rate_hz=64.0)
+
+
+def test_heart_rate_from_ppg_v2_naive_runs_without_error():
+    # NOT a "v2 is worse" assertion: v2-naive's ~37 vs ~8 bpm MAE only shows
+    # up against real PPG-DaLiA morphology (dicrotic notch, motion noise) —
+    # a clean synthetic sine+harmonic doesn't reproduce it (verified: v2
+    # scores just as well as v1 here), which is itself the reason
+    # scripts/validate_ppg_dalia.py exists instead of trusting unit tests
+    # alone. This just guards against the function breaking outright.
+    estimate = heart_rate_from_ppg_v2_naive(_synthetic_ppg(72.0), sample_rate_hz=64.0)
+    assert 30.0 < estimate < 240.0
 
 
 def test_resting_heart_rate_uses_low_percentile():

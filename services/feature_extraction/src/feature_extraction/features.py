@@ -27,12 +27,18 @@ _HR_BAND_HIGH_HZ = 2.5  # 150 bpm
 _PEAK_PROMINENCE_FRACTION = 0.4  # of the filtered window's stddev
 
 
-def bandpass_filter_ppg(values: np.ndarray, sample_rate_hz: float, order: int = 3) -> np.ndarray:
+def bandpass_filter_ppg(
+    values: np.ndarray,
+    sample_rate_hz: float,
+    low_hz: float = _HR_BAND_LOW_HZ,
+    high_hz: float = _HR_BAND_HIGH_HZ,
+    order: int = 3,
+) -> np.ndarray:
     """Zero-phase Butterworth bandpass isolating the cardiac component of a PPG signal."""
     if values.size == 0:
         raise ValueError("values window is empty")
     nyquist = sample_rate_hz / 2.0
-    b, a = butter(order, [_HR_BAND_LOW_HZ / nyquist, _HR_BAND_HIGH_HZ / nyquist], btype="band")
+    b, a = butter(order, [low_hz / nyquist, high_hz / nyquist], btype="band")
     padlen = 3 * (max(len(a), len(b)) - 1)
     if values.size <= padlen:
         raise ValueError(
@@ -41,19 +47,29 @@ def bandpass_filter_ppg(values: np.ndarray, sample_rate_hz: float, order: int = 
     return filtfilt(b, a, values)
 
 
-def heart_rate_from_ppg(values: np.ndarray, sample_rate_hz: float) -> float:
+def heart_rate_from_ppg(
+    values: np.ndarray,
+    sample_rate_hz: float,
+    low_hz: float = _HR_BAND_LOW_HZ,
+    high_hz: float = _HR_BAND_HIGH_HZ,
+    prominence_fraction: float = _PEAK_PROMINENCE_FRACTION,
+) -> float:
     """Instantaneous heart rate (bpm) from a raw PPG window via peak-interval detection.
 
     Bandpass-filters the window, finds systolic peaks at least one
     plausible-heartbeat apart, and returns 60 / mean(peak-to-peak interval).
+    `low_hz`/`high_hz`/`prominence_fraction` default to the tuned v1 values
+    but are parameterized so a second, deliberately worse version can reuse
+    this exact implementation (see heart_rate_from_ppg_v2_naive below)
+    instead of duplicating it.
     """
-    filtered = bandpass_filter_ppg(values, sample_rate_hz)
-    # Minimum samples between peaks at the fastest plausible heart rate (_HR_BAND_HIGH_HZ).
-    min_distance_samples = max(int(sample_rate_hz / _HR_BAND_HIGH_HZ), 1)
+    filtered = bandpass_filter_ppg(values, sample_rate_hz, low_hz, high_hz)
+    # Minimum samples between peaks at the fastest plausible heart rate (high_hz).
+    min_distance_samples = max(int(sample_rate_hz / high_hz), 1)
     peaks, _ = find_peaks(
         filtered,
         distance=min_distance_samples,
-        prominence=_PEAK_PROMINENCE_FRACTION * float(np.std(filtered)),
+        prominence=prominence_fraction * float(np.std(filtered)),
     )
     if peaks.size < 2:
         raise ValueError("not enough peaks detected to compute a heart rate")
@@ -61,6 +77,27 @@ def heart_rate_from_ppg(values: np.ndarray, sample_rate_hz: float) -> float:
     peak_intervals_s = np.diff(peaks) / sample_rate_hz
     mean_interval_s = float(np.mean(peak_intervals_s))
     return 60.0 / mean_interval_s
+
+
+ALGO_VERSION_V2_NAIVE = "v2-naive-wideband"
+
+
+def heart_rate_from_ppg_v2_naive(values: np.ndarray, sample_rate_hz: float) -> float:
+    """A real, reproducible "bad" version for week3-layer1-deepening-guide.md
+    Step 3/4's gray-release demo — not a synthetic placeholder. These are
+    literally the pre-tuning parameters from week1-2-layer1-guide.md Step 6:
+    a wider 0.5-4 Hz band with no peak-prominence filter, which lets each PPG
+    pulse's dicrotic notch register as its own peak. Measured ~37 bpm MAE
+    against PPG-DaLiA ground truth, vs ~8 bpm for heart_rate_from_ppg's
+    tuned defaults (see scripts/validate_ppg_dalia.py).
+    """
+    return heart_rate_from_ppg(values, sample_rate_hz, low_hz=0.5, high_hz=4.0, prominence_fraction=0.0)
+
+
+HEART_RATE_ALGORITHMS = {
+    ALGO_VERSION_V1: heart_rate_from_ppg,
+    ALGO_VERSION_V2_NAIVE: heart_rate_from_ppg_v2_naive,
+}
 
 
 def resting_heart_rate(heart_rate_bpm: np.ndarray, low_percentile: float = 10.0) -> float:
