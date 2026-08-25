@@ -7,6 +7,13 @@ class Settings(BaseSettings):
     kafka_bootstrap_servers: str = "localhost:29092"
     raw_signals_topic: str = "raw-signals"
     features_topic: str = "features"
+    # week4-layer2-milestone-guide.md Step 2: the second output path off of
+    # feature_extraction — a throttled, aggregated-snapshot stream for
+    # insight_service, decoupled via Kafka rather than insight_service
+    # polling Postgres directly.
+    features_extracted_topic: str = "features-extracted"
+    insight_throttle_seconds: float = 60.0
+    insight_snapshot_window_count: int = 5
     consumer_group_id: str = "feature-extraction"
     config_service_base_url: str = "http://localhost:8002"
     # Plain Postgres for the `features` table (week1-2-layer1-guide.md Step 7).

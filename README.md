@@ -20,12 +20,22 @@ device_simulator (replays WESAD/PPG-DaLiA)
 └─────────────────┘      └───────────────────┘      │  gray-release aware)  │
                                                        └──────────┬───────────┘
                                   ┌────────────────────┬──────────┴───────────┐
-                                  ▼                    ▼
+                                  ▼                    ▼ (throttled, aggregated snapshot)
                        ┌────────────────┐   ┌────────────────────┐
-                       │ TimescaleDB     │   │ insight_service     │
-                       │ (raw + feature  │   │ (LLM, Redis cache,  │
-                       │  time series)   │   │  eval, A/B)         │
-                       └────────────────┘   └──────────┬──────────┘
+                       │ Postgres        │   │ Redpanda            │
+                       │ features table  │   │ features-extracted  │
+                       │ (TimescaleDB    │   │  topic              │
+                       │  hypertable:    │   └──────────┬──────────┘
+                       │  Week 8+)       │              ▼
+                       └────────────────┘   ┌────────────────────┐
+                                             │ insight_service     │
+                                             │ .consumer (LLM,     │
+                                             │  Redis cache) →     │
+                                             │  device_insights    │
+                                             └──────────┬──────────┘
+                                                         │
+                                       (separately: a logged-in user can also
+                                        trigger .main's on-demand endpoint)
                                                          ▼
                                               ┌────────────────────┐
                                               │ api (FastAPI)       │
@@ -83,16 +93,20 @@ Each service under `services/*` is an independently installable Python package
 (`pip install -e .`) with its own `pyproject.toml` and `Dockerfile`, so it can run
 standalone or as part of `docker compose`.
 
-### Run the Layer 1 pipeline end-to-end
+### Run the pipeline end-to-end (Layer 1 + Layer 2)
 
 Once `docker compose up -d` and `make bootstrap` have run, and at least one
 subject's data is under `data/raw/ppg_dalia/PPG_FieldStudy/` (see
-[data/README.md](data/README.md)), run each of these in its own terminal:
+[data/README.md](data/README.md)), run each of these in its own terminal.
+`insight_service` needs a real `OPENAI_API_KEY` in `.env` to do anything
+useful on a cache miss — without one it'll log-and-skip every generation
+(Step 5's "调用失败时不要让整个consumer挂掉" applies to a missing key too).
 
 ```bash
 services/config_service/.venv/bin/uvicorn config_service.main:app --app-dir services/config_service/src --port 8002
 services/ingestion/.venv/bin/python -m ingestion.run
 services/feature_extraction/.venv/bin/python -m feature_extraction.main
+services/insight_service/.venv/bin/python -m insight_service.consumer
 services/device_simulator/.venv/bin/python -m device_simulator.replay --subject S2
 ```
 
@@ -152,6 +166,43 @@ MAE in `validate_ppg_dalia.py` before being fixed to ~8 bpm. Publishing it as
 a canary and rolling it back is a genuine "ship a regression, catch it,
 revert it" exercise, not a no-op toggle.
 
+### Insights pipeline (Layer 2)
+
+The PRD's second output path off of Layer 1: `feature_extraction` throttles
+each device to at most one `InsightRequest` per `insight_throttle_seconds`
+(default 60s), aggregating the last 5 windows into a snapshot
+(`heart_rate_mean`/`heart_rate_trend`) rather than firing an LLM call per
+8-second window — real products don't burn a token on every window, and
+neither should this demo. Published to `features-extracted` (Kafka), never
+by `insight_service` polling Postgres directly — same decoupling pattern as
+Layer 1's `raw-signals` → `features` hop.
+
+`insight_service.consumer` (distinct from `insight_service.main`'s
+user-triggered, RBAC-gated `/insights/generate` HTTP endpoint — that one
+persists to api's own `insights` table; this one is autonomous and owns its
+own `device_insights` table) does, per request: normalize the snapshot to a
+Redis cache key (rounded to 2 decimal places + prompt/model version, so
+72.001 vs 72.002 bpm don't miss the cache) → on a hit, skip the LLM entirely;
+on a miss, call OpenAI (one retry, 15s timeout, failures logged and skipped
+rather than crashing the consumer) and cache the result → persist the
+`DeviceInsight` either way, `cache_hit` and `latency_ms` included, so cache
+hit rate and the latency/cost delta it buys are just a query away instead of
+a claim.
+
+To watch a cache hit happen (after the pipeline above has been running a
+minute or two — needs a real `OPENAI_API_KEY`):
+
+```bash
+docker exec vitalstream-postgres-1 psql -U vitalstream -d vitalstream \
+  -c "SELECT device_id, cache_hit, latency_ms, generated_at, insight_text FROM device_insights ORDER BY generated_at DESC LIMIT 10;"
+```
+
+Because the throttle only fires every 60s and the snapshot rounds to 2
+decimal places, a device whose heart rate has been flat for a while will
+naturally produce the same cache key twice — the second row will show
+`cache_hit = true` and a `latency_ms` an order of magnitude below the first
+(a Redis round-trip vs. a full LLM call).
+
 ### Observability (tracing)
 
 `docker compose up -d` includes Jaeger (`jaegertracing/all-in-one`) — UI at
@@ -179,8 +230,7 @@ signal-processing math is comparatively cheap).
 
 ## Status
 
-Layer 1 (PRD milestones: Week 1-2 + Week 3) is working end-to-end and
-load-tested:
+Layers 1-2 (PRD milestones: Week 1-2, Week 3, Week 4) are working end-to-end:
 
 - **Week 1-2**: the device simulator replays real PPG-DaLiA wrist-BVP data
   over HTTP, ingestion batches it onto Redpanda, and feature_extraction
@@ -199,6 +249,17 @@ load-tested:
   [benchmarks/results.md](benchmarks/results.md) for the full methodology,
   including a couple of benchmarking dead ends worth knowing about before
   trusting any throughput number on this stack.
+- **Week 4**: `feature_extraction` throttles per-device output onto
+  `features-extracted` (Kafka-decoupled, not Postgres-polled); `insight_service
+  .consumer` turns aggregated snapshots into cached, LLM-generated advice.
+  Live-verified end-to-end against real PPG-DaLiA replay and a real OpenAI
+  key: generated insights correctly referenced the actual heart-rate numbers
+  and trend direction (not templated filler), a real rate-limit/quota error
+  was hit mid-run and the consumer logged-and-skipped it without crashing
+  (features kept flowing throughout), and the fixed-precision cache key
+  produced a genuine, unforced 13/26 (50%) cache hit rate during replay at
+  ~0.6ms average vs ~1334ms for an actual LLM call — the first real number
+  for PRD 8's "cache hit rate → cost/latency savings" metric.
 
-Layers 2-3 (LLM insights, full-stack delivery) are still scaffolds — see
+Layer 3 (full-stack delivery) is still a scaffold — see
 [docs/PRD.md](docs/PRD.md) section 7 for the milestone plan.

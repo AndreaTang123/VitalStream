@@ -92,12 +92,47 @@ class ConfigVersion(BaseModel):
 
 
 class Insight(BaseModel):
+    """A user-requested, on-demand insight (PRD 4.5 `POST /insights/generate`,
+    triggered via api's RBAC-gated endpoint and owned by api's own `insights`
+    table). Distinct from `DeviceInsight` below, which is the Week 4
+    milestone's *autonomous* background pipeline — same underlying LLM/cache
+    machinery, different trigger (a logged-in user vs. a throttled stream of
+    device feature windows) and different persisted owner."""
+
     id: UUID
     user_id: UUID
     content: str
     model_version: str
     eval_score: float | None = None
     created_at: datetime
+
+
+class InsightRequest(BaseModel):
+    """Published to the `features-extracted` topic once feature_extraction's
+    per-device throttle allows it (week4-layer2-milestone-guide.md Step 2) —
+    an aggregated snapshot over the last N windows, not a single Feature
+    (too little signal to generate a non-generic insight from)."""
+
+    device_id: UUID
+    feature_snapshot: dict[str, float]
+    window_start: float
+    window_end: float
+
+
+class DeviceInsight(BaseModel):
+    """The autonomous counterpart to `Insight`: one row per InsightRequest
+    processed by insight_service's Kafka consumer, cache_hit/latency_ms kept
+    because they're the raw material for PRD 8's "cache hit rate -> cost/
+    latency savings" metric, not just a debugging aid."""
+
+    device_id: UUID
+    insight_text: str
+    feature_snapshot: dict[str, float]
+    model: str
+    prompt_version: str
+    cache_hit: bool
+    latency_ms: float
+    generated_at: float
 
 
 class AuditLog(BaseModel):

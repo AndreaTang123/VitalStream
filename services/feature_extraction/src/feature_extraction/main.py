@@ -28,12 +28,13 @@ from uuid import UUID
 import numpy as np
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from opentelemetry import propagate, trace
-from vitalstream_common.schemas import Feature, SignalBatch, SignalType
+from vitalstream_common.schemas import Feature, InsightRequest, SignalBatch, SignalType
 from vitalstream_common.telemetry import configure_tracing
 
 from feature_extraction.config_client import config_client, resolve_algo_version
 from feature_extraction.db import FeatureStore
 from feature_extraction.features import ALGO_VERSION_V1, HEART_RATE_ALGORITHMS
+from feature_extraction.insight_throttle import aggregate_snapshot, should_publish_insight
 from feature_extraction.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,13 @@ class FeatureExtractionWorker:
         self._buffers: dict[UUID, _DeviceBuffer] = defaultdict(_DeviceBuffer)
         self._active_config: dict | None = None
         self._config_refresh_task: asyncio.Task | None = None
+        # week4-layer2-milestone-guide.md Step 2: last N (window_start,
+        # window_end, bpm) per device, for snapshot aggregation, plus when
+        # each device last got an InsightRequest, for throttling.
+        self._recent_windows: dict[UUID, deque[tuple[float, float, float]]] = defaultdict(
+            lambda: deque(maxlen=settings.insight_snapshot_window_count)
+        )
+        self._last_insight_ts: dict[UUID, float] = {}
 
     async def start(self) -> None:
         # Called here rather than at module import time so importing this
@@ -185,6 +193,41 @@ class FeatureExtractionWorker:
             )
         with tracer.start_as_current_span("write features row (postgres)"):
             await self._store.insert(feature, window_end=datetime.fromtimestamp(window_end, tz=UTC))
+
+        await self._maybe_publish_insight_request(device_id, window_start, window_end, bpm)
+
+    async def _maybe_publish_insight_request(
+        self, device_id: UUID, window_start: float, window_end: float, bpm: float
+    ) -> None:
+        """The pipeline's second output path (PRD 3/4.1: features consumer's
+        output goes both to Postgres AND to LLM insight generation). Not
+        every window publishes — only once per insight_throttle_seconds per
+        device, and on an aggregated snapshot of the last N windows rather
+        than this single one (week4-layer2-milestone-guide.md Step 2)."""
+        recent = self._recent_windows[device_id]
+        recent.append((window_start, window_end, bpm))
+
+        last_ts = self._last_insight_ts.get(device_id)
+        if not should_publish_insight(window_end, last_ts, settings.insight_throttle_seconds):
+            return
+
+        snapshot = aggregate_snapshot([value for _, _, value in recent])
+        request = InsightRequest(
+            device_id=device_id,
+            feature_snapshot=snapshot,
+            window_start=recent[0][0],
+            window_end=recent[-1][1],
+        )
+
+        assert self._producer is not None
+        with tracer.start_as_current_span("produce features-extracted"):
+            await self._producer.send_and_wait(
+                settings.features_extracted_topic,
+                value=request.model_dump(mode="json"),
+                key=str(device_id).encode("utf-8"),
+            )
+        self._last_insight_ts[device_id] = window_end
+        logger.info("published InsightRequest for %s: %s", device_id, snapshot)
 
 
 async def main() -> None:
