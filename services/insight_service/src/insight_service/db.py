@@ -14,7 +14,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, String, Uuid
+from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Uuid
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from vitalstream_common.schemas import DeviceInsight
@@ -36,6 +36,9 @@ class DeviceInsightORM(Base):
     cache_hit: Mapped[bool] = mapped_column(Boolean)
     latency_ms: Mapped[float] = mapped_column(Float)
     generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    prompt_tokens: Mapped[int] = mapped_column(Integer)
+    completion_tokens: Mapped[int] = mapped_column(Integer)
+    cost_usd: Mapped[float] = mapped_column(Float)
 
 
 class DeviceInsightStore:
@@ -64,6 +67,9 @@ class DeviceInsightStore:
                     cache_hit=insight.cache_hit,
                     latency_ms=insight.latency_ms,
                     generated_at=datetime.fromtimestamp(insight.generated_at, tz=UTC),
+                    prompt_tokens=insight.prompt_tokens,
+                    completion_tokens=insight.completion_tokens,
+                    cost_usd=insight.cost_usd,
                 )
             )
             await session.commit()

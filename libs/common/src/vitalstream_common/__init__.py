@@ -1,8 +1,10 @@
 from vitalstream_common.schemas import (
     AuditLog,
+    BenchmarkCase,
     ConfigVersion,
     Device,
     DeviceInsight,
+    EvalResult,
     Feature,
     Insight,
     InsightRequest,
@@ -14,9 +16,11 @@ from vitalstream_common.schemas import (
 
 __all__ = [
     "AuditLog",
+    "BenchmarkCase",
     "ConfigVersion",
     "Device",
     "DeviceInsight",
+    "EvalResult",
     "Feature",
     "Insight",
     "InsightRequest",

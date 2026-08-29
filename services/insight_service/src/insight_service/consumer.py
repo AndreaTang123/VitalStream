@@ -73,6 +73,13 @@ class InsightConsumerWorker:
                 cache_hit=True,
                 latency_ms=(time.monotonic() - start) * 1000,
                 generated_at=time.time(),
+                # A hit produces no new LLM call, so no new cost — that's
+                # exactly the number PRD 8's cache-savings metric wants
+                # (week5-layer2-deepening-guide.md Step 6), not the original
+                # call's cost restated.
+                prompt_tokens=0,
+                completion_tokens=0,
+                cost_usd=0.0,
             )
             logger.info("cache hit for %s (%.1fms)", request.device_id, insight.latency_ms)
         else:
@@ -93,6 +100,9 @@ class InsightConsumerWorker:
                 cache_hit=False,
                 latency_ms=response.latency_ms,
                 generated_at=time.time(),
+                prompt_tokens=response.prompt_tokens,
+                completion_tokens=response.completion_tokens,
+                cost_usd=response.cost_usd,
             )
             await set_cached(key, insight)
             logger.info(

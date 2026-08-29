@@ -123,7 +123,13 @@ class DeviceInsight(BaseModel):
     """The autonomous counterpart to `Insight`: one row per InsightRequest
     processed by insight_service's Kafka consumer, cache_hit/latency_ms kept
     because they're the raw material for PRD 8's "cache hit rate -> cost/
-    latency savings" metric, not just a debugging aid."""
+    latency savings" metric, not just a debugging aid.
+
+    prompt_tokens/completion_tokens/cost_usd (week5-layer2-deepening-guide.md
+    Step 1/6) reflect the call that actually produced insight_text: on a
+    cache miss, the real OpenAI usage + a static per-model price table; on a
+    cache hit, 0 for all three — a hit produces no new LLM cost, and that's
+    the point being measured (PRD 8's cache-savings metric)."""
 
     device_id: UUID
     insight_text: str
@@ -133,6 +139,39 @@ class DeviceInsight(BaseModel):
     cache_hit: bool
     latency_ms: float
     generated_at: float
+    prompt_tokens: int
+    completion_tokens: int
+    cost_usd: float
+
+
+class BenchmarkCase(BaseModel):
+    """One hand-written case in the Layer 2 eval benchmark
+    (week5-layer2-deepening-guide.md Step 2, benchmarks/cases.yaml).
+    `checks` are natural-language checkpoints a human judged as necessary —
+    not full expected-output text, since exact-match against LLM output
+    isn't realistic. See eval/judge.py for how they're actually evaluated."""
+
+    case_id: str
+    feature_snapshot: dict[str, float]
+    checks: list[str]
+    category: str
+
+
+class EvalResult(BaseModel):
+    """One (case, prompt_version, model) run's outcome from
+    evaluation/run_benchmark.py (week5-layer2-deepening-guide.md Step 4)."""
+
+    case_id: str
+    prompt_version: str
+    model: str
+    insight_text: str
+    grounded: bool
+    hallucination_flag: bool | None  # None: judge call failed, not scored — not the same as "no hallucination found"
+    judge_notes: str
+    latency_ms: float
+    prompt_tokens: int
+    completion_tokens: int
+    cost_usd: float
 
 
 class AuditLog(BaseModel):

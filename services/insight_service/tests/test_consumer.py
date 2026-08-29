@@ -52,7 +52,7 @@ async def test_cache_miss_calls_llm_persists_and_caches(worker, monkeypatch):
         llm_calls.append(feature_snapshot)
         return LLMResponse(
             content="stay active!", model_version="gpt-4o-mini", prompt_version="v1",
-            latency_ms=123.4, cost_usd=0.0,
+            latency_ms=123.4, prompt_tokens=50, completion_tokens=20, cost_usd=0.0000195,
         )
 
     cache_store: dict[str, DeviceInsight] = {}
@@ -78,6 +78,9 @@ async def test_cache_miss_calls_llm_persists_and_caches(worker, monkeypatch):
     assert len(rows) == 1
     assert rows[0].cache_hit is False
     assert rows[0].insight_text == "stay active!"
+    assert rows[0].prompt_tokens == 50
+    assert rows[0].completion_tokens == 20
+    assert rows[0].cost_usd > 0
 
 
 async def test_cache_hit_skips_llm_but_still_persists(worker, monkeypatch):
@@ -96,6 +99,9 @@ async def test_cache_hit_skips_llm_but_still_persists(worker, monkeypatch):
         cache_hit=False,
         latency_ms=500.0,
         generated_at=0.0,
+        prompt_tokens=50,
+        completion_tokens=20,
+        cost_usd=0.0000195,
     )
 
     async def fake_get_cached(key):
@@ -121,6 +127,10 @@ async def test_cache_hit_skips_llm_but_still_persists(worker, monkeypatch):
     rows = await _persisted_rows(worker)
     assert len(rows) == 1
     assert rows[0].cache_hit is True
+    # a hit costs nothing new, regardless of what the original call cost
+    assert rows[0].prompt_tokens == 0
+    assert rows[0].completion_tokens == 0
+    assert rows[0].cost_usd == 0.0
 
 
 async def test_llm_failure_is_logged_and_skipped_not_raised(worker, monkeypatch):

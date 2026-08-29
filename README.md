@@ -184,24 +184,60 @@ own `device_insights` table) does, per request: normalize the snapshot to a
 Redis cache key (rounded to 2 decimal places + prompt/model version, so
 72.001 vs 72.002 bpm don't miss the cache) → on a hit, skip the LLM entirely;
 on a miss, call OpenAI (one retry, 15s timeout, failures logged and skipped
-rather than crashing the consumer) and cache the result → persist the
-`DeviceInsight` either way, `cache_hit` and `latency_ms` included, so cache
-hit rate and the latency/cost delta it buys are just a query away instead of
-a claim.
-
-To watch a cache hit happen (after the pipeline above has been running a
-minute or two — needs a real `OPENAI_API_KEY`):
+rather than crashing the consumer), computing real cost from
+`usage.prompt_tokens`/`completion_tokens` against a static price table
+(`insight_service/pricing.py`) → persist the `DeviceInsight` either way,
+`cache_hit`/`latency_ms`/`cost_usd` included (a hit costs $0 and takes
+~1ms; a miss costs whatever the model call actually billed), so cache hit
+rate and the latency/cost delta it buys are a query away, not a claim —
+`insight_service.eval.cache_savings` runs that query and prints the
+"缓存命中率 X%，节省了约 $Y / 降低了 Z ms" summary directly.
 
 ```bash
-docker exec vitalstream-postgres-1 psql -U vitalstream -d vitalstream \
-  -c "SELECT device_id, cache_hit, latency_ms, generated_at, insight_text FROM device_insights ORDER BY generated_at DESC LIMIT 10;"
+services/insight_service/.venv/bin/python -m insight_service.eval.cache_savings --limit 200
 ```
 
-Because the throttle only fires every 60s and the snapshot rounds to 2
-decimal places, a device whose heart rate has been flat for a while will
-naturally produce the same cache key twice — the second row will show
-`cache_hit = true` and a `latency_ms` an order of magnitude below the first
-(a Redis round-trip vs. a full LLM call).
+**Hit rate depends heavily on traffic shape, not just time elapsed** — see
+[benchmarks/week5_eval_report.md](benchmarks/week5_eval_report.md) §2 for
+the measured numbers: one continuously-varying device's own snapshots rarely
+repeat exactly (0.2% hit rate over a full real replay), but multiple devices
+in similar physiological states organically collide on the same rounded
+snapshot constantly (56.9% across a synthetic fleet resting near the same
+heart rate) — this cache pays off at fleet scale, not from one device
+running longer.
+
+### Evaluation & A/B testing
+
+`benchmarks/cases.yaml` is 22 hand-written cases (4 categories: normal,
+elevated heart rate, HRV drop, boundary/edge cases) — each with human-written
+`checks` describing what a grounded, safe response should do, not full
+expected-output text (exact-matching LLM output isn't realistic).
+`insight_service.eval.judge` scores exactly two dimensions on purpose
+(more would make the eval framework more complex than the thing it's
+evaluating): `check_grounded` is a rule-based check (does the described
+trend direction match the data, does the text cite an actual number) —
+no LLM needed for that half. `check_hallucination` calls an LLM judge
+(same or a different model, configurable) with a strict yes/no + reason
+prompt, JSON-parsed; a judge failure scores as unscored (`None`), never a
+silent "no hallucination found".
+
+```bash
+services/insight_service/.venv/bin/python -m insight_service.eval.run_benchmark --prompt-version v1 --model gpt-4o-mini
+services/insight_service/.venv/bin/python -m insight_service.eval.run_benchmark --prompt-version v2 --model gpt-4o-mini
+```
+
+Each run calls the real LLM directly (bypassing Redis on purpose — eval
+measures generation quality, not cache hits) and writes one row per case to
+`benchmarks/results/{timestamp}_{prompt_version}_{model}.csv`, plus a
+grounded_rate/hallucination_rate/avg_latency/avg_cost summary to stdout.
+`v1` vs `v2` is a real, measured comparison, not a hypothetical one:
+**grounded_rate 18.2% → 95.5%**, at the cost of ~32% more latency and ~40%
+more cost per call. See
+[benchmarks/week5_eval_report.md](benchmarks/week5_eval_report.md) for the
+full comparison table, the chart, and — more interesting than the headline
+number — why v2 actually helps (not the failure mode the project originally
+guessed it would fix) and a real bug the eval process itself caught along
+the way.
 
 ### Observability (tracing)
 
@@ -230,7 +266,7 @@ signal-processing math is comparatively cheap).
 
 ## Status
 
-Layers 1-2 (PRD milestones: Week 1-2, Week 3, Week 4) are working end-to-end:
+Layers 1-2 (PRD milestones: Week 1-2 through Week 5) are working end-to-end:
 
 - **Week 1-2**: the device simulator replays real PPG-DaLiA wrist-BVP data
   over HTTP, ingestion batches it onto Redpanda, and feature_extraction
@@ -257,9 +293,24 @@ Layers 1-2 (PRD milestones: Week 1-2, Week 3, Week 4) are working end-to-end:
   and trend direction (not templated filler), a real rate-limit/quota error
   was hit mid-run and the consumer logged-and-skipped it without crashing
   (features kept flowing throughout), and the fixed-precision cache key
-  produced a genuine, unforced 13/26 (50%) cache hit rate during replay at
-  ~0.6ms average vs ~1334ms for an actual LLM call — the first real number
-  for PRD 8's "cache hit rate → cost/latency savings" metric.
+  produced a genuine, unforced 13/26 (50%) cache hit rate during a short
+  partial replay — Week 5's fuller run tells a more complete story (below).
+- **Week 5**: real eval, not a placeholder — `benchmarks/cases.yaml` (22
+  hand-written cases) scored on two dimensions (rule-based groundedness,
+  LLM-judge hallucination detection). A real, measured prompt A/B:
+  **grounded_rate 18.2% → 95.5%** (v1 → v2), for a real cost — ~32% more
+  latency, ~40% more cost per call. The fix targeted a *different* problem
+  than the one this project started out expecting (v1 essentially never
+  hallucinated; it just too often skipped citing the actual number it was
+  given), which only showed up because the benchmark was run for real
+  instead of assumed. Real per-call cost from OpenAI's actual token usage
+  (not estimated) is now in every `device_insights`/`Insight` row.
+  Draining a full 514-row single-device replay to completion (not a partial
+  snapshot mid-backlog) put the real organic cache hit rate at 0.2% — very
+  different from Week 4's 50%, because a fleet of similar devices, not one
+  continuously-varying device, is what actually drives this cache's hit
+  rate (confirmed: 56.9% across 40 synthetic devices resting near the same
+  heart rate). See [benchmarks/week5_eval_report.md](benchmarks/week5_eval_report.md).
 
 Layer 3 (full-stack delivery) is still a scaffold — see
 [docs/PRD.md](docs/PRD.md) section 7 for the milestone plan.

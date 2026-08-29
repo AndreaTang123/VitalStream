@@ -19,5 +19,11 @@ class Settings(BaseSettings):
     consumer_group_id: str = "insight-generator"
     postgres_dsn: str = "postgresql+asyncpg://vitalstream:vitalstream@localhost:5432/vitalstream"
 
+    # week5-layer2-deepening-guide.md Step 3: same model as generation by
+    # default (cheap), but configurable to a different one to reduce
+    # "grading its own homework" bias.
+    judge_model_name: str = "gpt-4o-mini"
+    judge_timeout_seconds: float = 15.0
+
 
 settings = Settings()
