@@ -16,13 +16,15 @@ import logging
 from contextlib import asynccontextmanager
 from uuid import UUID
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, status
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from pydantic import BaseModel
 from vitalstream_common.schemas import SignalBatch, SignalType
 from vitalstream_common.telemetry import configure_tracing
 
+from ingestion.device_registry import device_registry
 from ingestion.kafka_producer import producer
+from ingestion.security import verify_service_token
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +52,9 @@ async def lifespan(_: FastAPI):
     loop_name = type(asyncio.get_running_loop()).__module__
     logger.info("ingestion running on event loop: %s", loop_name)
     await producer.start()
+    await device_registry.start()
     yield
+    await device_registry.stop()
     await producer.stop()
 
 
@@ -58,8 +62,16 @@ app = FastAPI(title="vitalstream-ingestion", lifespan=lifespan)
 FastAPIInstrumentor.instrument_app(app)
 
 
-@app.post("/api/v1/devices/{device_id}/signals", status_code=202)
+@app.post("/api/v1/devices/{device_id}/signals", status_code=202, dependencies=[Depends(verify_service_token)])
 async def ingest_signal_batch(device_id: UUID, batch: SignalBatchIn) -> dict:
+    # No audit log here even on rejection (week6 Step 7): this is the
+    # highest-frequency path in the system, and device-auth failures belong
+    # in metrics/monitoring, not the low-volume "who saw whose health data"
+    # audit trail.
+    if not device_registry.is_registered(device_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="device_id is not a registered device"
+        )
     await producer.send(SignalBatch(device_id=device_id, **batch.model_dump()))
     return {"accepted": len(batch.values)}
 

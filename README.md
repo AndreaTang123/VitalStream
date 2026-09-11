@@ -68,10 +68,15 @@ services/
   api/                 Layer 3 — FastAPI backend: auth (OAuth2/JWT), RBAC, audit log
 libs/common/           Shared Pydantic schemas + telemetry helpers used across services
 frontend/              Layer 3 — Next.js dashboard (patient/coach views)
+scripts/               scripts/seed.py — demo accounts/devices/coach grants for local dev
 infra/                 docker, prometheus, grafana, k6 load-test scripts, cloud VM bootstrap
 data/                  Dataset download script + local data cache
 docs/                  PRD and architecture docs
 ```
+
+`services/api/migrations/` holds api's Alembic revisions (schema baseline +
+Week 6's RBAC/audit tables) — see "认证与权限" below for what it does and
+doesn't own.
 
 ## Quick start
 
@@ -79,6 +84,8 @@ docs/                  PRD and architecture docs
 cp .env.example .env
 docker compose up -d          # Kafka/Redis, Postgres, TimescaleDB, Prometheus, Grafana
 make bootstrap                # create venvs and install each Python service in editable mode
+services/api/.venv/bin/alembic -c services/api/alembic.ini upgrade head  # build api's Layer 3 tables
+services/api/.venv/bin/python -m scripts.seed                           # demo accounts + devices
 make test                     # run all service test suites
 ```
 
@@ -107,8 +114,15 @@ services/config_service/.venv/bin/uvicorn config_service.main:app --app-dir serv
 services/ingestion/.venv/bin/python -m ingestion.run
 services/feature_extraction/.venv/bin/python -m feature_extraction.main
 services/insight_service/.venv/bin/python -m insight_service.consumer
-services/device_simulator/.venv/bin/python -m device_simulator.replay --subject S2
+services/api/.venv/bin/uvicorn api.main:app --app-dir services/api/src --port 8000
+services/device_simulator/.venv/bin/python -m device_simulator.replay --subject S2 \
+  --device-id <the S2 device id scripts/seed.py printed>
 ```
+
+Since Week 6/Layer 3, `ingestion` rejects any `device_id` that isn't a row
+in `devices` (and any request missing the `X-Service-Token` header — the
+simulator reads it from `$SERVICE_TOKEN`, matching `.env`), so run
+`scripts/seed.py` first and pass one of the device ids it prints.
 
 The simulator replays real wrist-PPG samples from PPG-DaLiA subject S2 as if
 they were arriving live from a wearable (`--speed` controls playback speed;
@@ -239,6 +253,104 @@ number — why v2 actually helps (not the failure mode the project originally
 guessed it would fix) and a real bug the eval process itself caught along
 the way.
 
+### 认证与权限 (Layer 3, Week 6)
+
+**角色定义**：`patient`（只能访问自己的数据）、`coach`（只能访问被显式授权的
+patient）、`admin`（平台运维，PRD 里的 "operator" 概念——代码里统一叫
+`admin`，没有为同一角色引入两个名字）。
+
+**两层 RBAC**：
+
+1. **角色级**（`api/rbac.py: require_role`）：端点级别的粗粒度门禁，比如
+   `POST /config/feature-algo` 只允许 `admin`。
+2. **资源级**（`api/deps.py: authorize_user_access` / `authorize_device_access`）：
+   同一个角色内，谁能访问哪条具体数据。`patient` 只能是自己；`coach` 必须在
+   `coach_patient` 表里有一行显式授权记录，否则一律拒绝——没有这张表，"coach
+   能看患者数据" 就退化成 "coach 能看所有人数据"。两个依赖都以数据库里的归属
+   关系为准（例如 `authorize_device_access` 先查 `devices.user_id`），不信任
+   JWT payload 或路径参数里的任何 id。
+
+**越权返回码的取舍**：本项目里越权统一返回 `403`，而不是把 "不存在" 和 "无权
+访问" 都伪装成 `404`。原因是这套 RBAC 面向的是 patient/coach/admin 三种已知
+身份之间的内部协作场景（不是防止外部人枚举陌生 `user_id`），`403` 能让前端
+（Week 7）清楚区分 "这条路径你走错了" 和 "这个人根本不存在"，调试体验更好；
+真正未知的 id（比如 device 不存在）仍然返回 `404`。这与很多公开 SaaS API 的
+惯例相反，是刻意的选择，面试如果问起就是这个理由。
+
+**安全基线**（Step 8 清单，逐条已过一遍）：
+
+- [x] `JWT_SECRET_KEY`/`SERVICE_TOKEN` 来自环境变量，`.env` 在 `.gitignore`
+      里，仓库里没有真实密钥。
+- [x] 解码 token 时用 `algorithms=[settings.jwt_algorithm]` 显式指定白名单
+      （`api/auth.py`），拒绝 `alg: none` 类型的伪造 token；`exp` 由 PyJWT
+      自动校验。
+- [x] access token 30 分钟过期；refresh token 7 天，`jti` 落库
+      `refresh_tokens`，`logout` 真正撤销它——纯无状态 JWT 做不到这一点。
+- [x] 密码用 bcrypt 哈希；`login` 对 "用户不存在" 和 "密码错误" 返回完全相同
+      的错误信息（防枚举）。
+- [x] 所有非公开端点都有认证依赖——`tests/test_route_auth.py` 遍历
+      `app.routes` 断言这件事，而不是靠人工检查。
+- [x] CORS 只允许 `http://localhost:3000`（Week 7 前端），不是 `["*"]`。
+- [x] `login` 有基础限流（`api/rate_limit.py`：单进程固定窗口计数器，够用但
+      不是分布式方案——这个项目单进程部署，上 Redis 是过度设计）。
+- [x] 响应用独立的 `UserOut`/`DeviceOut` 等 pydantic 模型，从不直接把 ORM
+      对象序列化出去，`hashed_password` 永远不会出现在响应里。
+- [x] 数据库查询全部参数化：ORM 查询天然如此；`routers/features.py` 里唯一
+      的裸 SQL 用 SQLAlchemy `text()` + 具名绑定参数，没有 f-string 拼 SQL。
+
+**审计日志只记录敏感操作**（`api/audit.py`）：跨用户健康数据读取
+（`insights.read`/`features.read`，仅当 `actor.id != target_user_id`）、配置
+变更（`config.publish_canary`/`config.rollback`）、认证事件
+（`auth.login_success`/`auth.login_failed`）、以及 `api/deps.py` 里所有资源
+级授权失败（`status='denied'`）。自己读自己的数据不写审计——全量记录会把
+"谁看了谁的数据" 这个真正有价值的问题淹没在噪音里。写入与业务操作同事务、
+同步提交，不走 Kafka：这些端点低频，丢一条审计记录是合规问题，可以接受的
+性能代价换来的是"审计不会丢"的保证。`GET /audit-logs` 本身也有权限收敛：
+`coach` 只能看到自己触发的、或指向自己被授权 patient 的记录；只有 `admin`
+能看全量——审计接口自己权限没做对，是最讽刺也最常见的一类漏洞。
+
+**Alembic 与跨服务表的边界**：`services/api/migrations` 只管理 `api` 自己
+的表（`users`/`devices`/`coach_patient`/`insights`/`refresh_tokens`/
+`audit_logs`）。`features`（feature_extraction 拥有）和 `device_insights`
+（insight_service 拥有）虽然物理上在同一个 Postgres 实例里，但 schema 由各
+自服务的 `Base.metadata.create_all` 管理——`api` 只用只读裸 SQL 查询它们
+（`routers/features.py`），不去用 Alembic 给别的服务的表加外键。跨服务共享
+物理数据库、各自管理各自 schema 是这个项目从 Week 1 就定下的边界，这周没有
+改变它；`insights.device_id -> devices` 这类外键因此也没有加，取舍在这里
+写清楚而不是假装做了。同理，`config_service` 自己的 `algo_version_audit`
+表也保留不动，没有并入 `api` 的 `audit_logs`：它是 `config_service` 自己
+`GET .../audit-log` 端点的数据源，服务边界内自洽；`api` 的 `audit_logs`
+额外记录的是 `config.publish_canary`/`config.rollback` 这两个操作*谁通过
+api 触发的*（`actor_id`/`ip_address` 这些 api 才知道的身份信息），两张表
+回答的是不同的问题（"这个 algo 的版本历史" vs "谁在什么时候做了什么"），
+合并会丢失后者身份维度或引入跨服务写耦合，所以保留两张表是有意的选择。
+
+### API 使用
+
+```bash
+# 1. 登录拿 token（scripts/seed.py 建的账号，密码统一是 password123）
+curl -s -X POST localhost:8000/api/v1/auth/login \
+  -d "username=patient-a@vitalstream.dev&password=password123" | tee /tmp/login.json
+ACCESS=$(python3 -c "import json;print(json.load(open('/tmp/login.json'))['access_token'])")
+
+# 2. 查自己的健康洞察（Week 4-5 链路真实生成的数据，不是 mock）
+curl -s localhost:8000/api/v1/users/<patient-a-id>/insights \
+  -H "Authorization: Bearer $ACCESS"
+
+# 3. 越权被拒：用 patient A 的 token 查 patient B 的数据 -> 403
+curl -s -o /dev/null -w "%{http_code}\n" localhost:8000/api/v1/users/<patient-b-id>/insights \
+  -H "Authorization: Bearer $ACCESS"
+
+# 4. 审计留痕：用 coach C（已被授权访问 A）登录后查审计日志
+curl -s -X POST localhost:8000/api/v1/auth/login \
+  -d "username=coach-c@vitalstream.dev&password=password123" | tee /tmp/coach.json
+COACH_ACCESS=$(python3 -c "import json;print(json.load(open('/tmp/coach.json'))['access_token'])")
+curl -s localhost:8000/api/v1/users/<patient-a-id>/insights -H "Authorization: Bearer $COACH_ACCESS"
+curl -s localhost:8000/api/v1/audit-logs -H "Authorization: Bearer $COACH_ACCESS"
+```
+
+This is also the Week 8 demo recording's script for the "企业级交付" segment.
+
 ### Observability (tracing)
 
 `docker compose up -d` includes Jaeger (`jaegertracing/all-in-one`) — UI at
@@ -312,5 +424,19 @@ Layers 1-2 (PRD milestones: Week 1-2 through Week 5) are working end-to-end:
   rate (confirmed: 56.9% across 40 synthetic devices resting near the same
   heart rate). See [benchmarks/week5_eval_report.md](benchmarks/week5_eval_report.md).
 
-Layer 3 (full-stack delivery) is still a scaffold — see
-[docs/PRD.md](docs/PRD.md) section 7 for the milestone plan.
+- **Week 6**: `api` grew from a scaffold into a real control-plane service —
+  OAuth2/JWT auth with revocable refresh tokens, two-layer RBAC (role +
+  resource, the latter backed by a real `coach_patient` grants table rather
+  than "coach sees everyone"), and an audit log scoped to what PRD 5.3
+  actually asks for (cross-user reads, config mutations, auth events, denials)
+  instead of a blanket request log. Alembic now owns api's own schema
+  (`services/api/migrations`); Week 3's config `/admin/*` routes stayed
+  proxied through `api`'s RBAC+audit layer (already done then, verified this
+  week); `ingestion`'s signal endpoint gained service-token auth and rejects
+  unregistered devices. See "认证与权限"/"API 使用" above for the design
+  tradeoffs and a runnable demo script; `tests/test_rbac.py` /
+  `tests/test_route_auth.py` / `tests/test_audit.py` are the permission-matrix
+  and audit-trail tests backing the three acceptance-demo claims.
+
+Layer 3's frontend (Next.js) is Week 7 — Swagger UI (`/docs`) is this week's
+"UI". See [docs/PRD.md](docs/PRD.md) section 7 for the full milestone plan.

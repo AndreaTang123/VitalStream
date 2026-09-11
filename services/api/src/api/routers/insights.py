@@ -29,10 +29,14 @@ async def generate_insight(
     current_user: CurrentUser = Depends(get_current_user),
     session: AsyncSession = Depends(get_db),
 ) -> dict:
-    if current_user.role == Role.PATIENT and current_user.id != body.user_id:
+    # PRD 4.5: only the patient themself, or an admin, can trigger generation
+    # — unlike reads, this is not a coach-accessible action.
+    if current_user.role == Role.COACH or (
+        current_user.role == Role.PATIENT and current_user.id != body.user_id
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="patients may only generate insights for themselves",
+            detail="only the patient themself or an admin may generate insights",
         )
 
     async with httpx.AsyncClient(base_url=settings.insight_service_base_url, timeout=30.0) as client:
@@ -53,9 +57,17 @@ async def generate_insight(
     session.add(insight)
     await session.commit()
 
-    await write_audit_log(
-        session, actor_id=current_user.id, action="generate_insight", resource=f"user:{body.user_id}"
-    )
+    if current_user.id != body.user_id:
+        await write_audit_log(
+            session,
+            actor_id=current_user.id,
+            actor_email=current_user.email,
+            action="insights.generate",
+            resource_type="user",
+            resource_id=str(body.user_id),
+            target_user_id=body.user_id,
+            status="success",
+        )
 
     return {
         "id": str(insight.id),

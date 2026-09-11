@@ -12,6 +12,7 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "uvloop>=0.19",
     "aiokafka>=0.11",
+    "asyncpg>=0.29",
     "pydantic-settings>=2.3",
     "opentelemetry-instrumentation-fastapi>=0.46b0",
     "vitalstream-common",

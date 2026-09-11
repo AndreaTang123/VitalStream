@@ -43,7 +43,10 @@ async def test_replay_sends_one_batch_per_chunk(monkeypatch):
         ingestion_url="http://ingestion.test",
         speed=1_000_000.0,
         chunk_seconds=1.0,
+        service_token="test-token",
     )
+
+    assert sent[0].headers["x-service-token"] == "test-token"
 
     assert len(sent) == seconds
     assert b'"ppg"' in sent[0].content

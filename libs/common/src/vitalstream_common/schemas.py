@@ -17,7 +17,11 @@ from pydantic import BaseModel, Field
 class Role(StrEnum):
     PATIENT = "patient"
     COACH = "coach"
-    ADMIN = "admin"  # internal platform-ops role (PRD 1.3): config releases, audit log access
+    # Internal platform-ops role (PRD 1.3): config releases, audit log
+    # access, coach<->patient grants. Named ADMIN in code; this is the same
+    # role the Week 6 milestone guide calls "operator" — one name was kept
+    # rather than introduced a synonym partway through the project.
+    ADMIN = "admin"
 
 
 class DeviceStatus(StrEnum):
@@ -175,8 +179,17 @@ class EvalResult(BaseModel):
 
 
 class AuditLog(BaseModel):
-    id: UUID
-    actor_id: UUID
+    """Mirrors api's `audit_logs` table (PRD 5.3). `actor_id` is nullable —
+    a failed login has no authenticated identity yet, only `actor_email`."""
+
+    id: int
+    actor_id: UUID | None
+    actor_email: str | None
     action: str
-    resource: str
-    timestamp: datetime
+    resource_type: str | None
+    resource_id: str | None
+    target_user_id: UUID | None
+    status: str
+    ip_address: str | None
+    detail: dict | None
+    created_at: datetime

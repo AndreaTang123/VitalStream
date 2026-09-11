@@ -38,8 +38,12 @@ async def publish_canary(
     await write_audit_log(
         session,
         actor_id=current_user.id,
-        action="publish_config_canary",
-        resource=f"{body.algo_name}:{body.version}",
+        actor_email=current_user.email,
+        action="config.publish_canary",
+        resource_type="algo_version",
+        resource_id=f"{body.algo_name}:{body.version}",
+        status="success",
+        detail={"rollout_pct": body.rollout_pct},
     )
     return response.json()
 
@@ -61,7 +65,10 @@ async def rollback(
     await write_audit_log(
         session,
         actor_id=current_user.id,
-        action="rollback_config",
-        resource=f"{algo_name}:{version}",
+        actor_email=current_user.email,
+        action="config.rollback",
+        resource_type="algo_version",
+        resource_id=f"{algo_name}:{version}",
+        status="success",
     )
     return response.json()

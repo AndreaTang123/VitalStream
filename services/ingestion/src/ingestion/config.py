@@ -14,5 +14,12 @@ class Settings(BaseSettings):
     kafka_max_batch_size_bytes: int = 65536
     kafka_linger_ms: int = 20
 
+    # Week 6/Layer 3 (PRD 4.5): this endpoint is called by devices/the
+    # simulator, not a logged-in browser, so it's gated by a static shared
+    # secret rather than a user JWT — a device has no "login".
+    service_token: str = "change-me-in-real-env"
+    postgres_dsn: str = "postgresql://vitalstream:vitalstream@localhost:5432/vitalstream"
+    device_registry_refresh_seconds: float = 30.0
+
 
 settings = Settings()

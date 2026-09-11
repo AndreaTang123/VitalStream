@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import time
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -15,6 +16,11 @@ import httpx
 from vitalstream_common.schemas import SignalType
 
 from device_simulator.ppg_dalia import BVP_SAMPLE_RATE_HZ, default_data_dir, load_wrist_bvp
+
+# Week 6/Layer 3 (PRD 4.5): ingestion now requires this shared secret on
+# every signals POST (services/ingestion/src/ingestion/security.py) — the
+# simulator stands in for real device firmware, which never has a user JWT.
+DEFAULT_SERVICE_TOKEN = os.environ.get("SERVICE_TOKEN", "change-me-in-real-env")
 
 
 async def replay(
@@ -25,6 +31,7 @@ async def replay(
     ingestion_url: str,
     speed: float,
     chunk_seconds: float,
+    service_token: str,
 ) -> None:
     bvp = load_wrist_bvp(data_dir, subject)
     chunk_size = int(BVP_SAMPLE_RATE_HZ * chunk_seconds)
@@ -35,7 +42,8 @@ async def replay(
     # each chunk is sent, not what timestamp it claims).
     base_ts = time.time()
 
-    async with httpx.AsyncClient(base_url=ingestion_url, timeout=10.0) as client:
+    headers = {"X-Service-Token": service_token}
+    async with httpx.AsyncClient(base_url=ingestion_url, timeout=10.0, headers=headers) as client:
         for i in range(total_chunks):
             chunk = bvp[i * chunk_size : (i + 1) * chunk_size]
             payload = {
@@ -61,6 +69,11 @@ def main() -> None:
     parser.add_argument("--speed", type=float, default=20.0, help="playback speed multiplier (1.0 = real-time)")
     parser.add_argument("--chunk-seconds", type=float, default=1.0)
     parser.add_argument("--data-dir", default=None, help="defaults to <repo root>/data/raw/ppg_dalia/PPG_FieldStudy")
+    parser.add_argument(
+        "--service-token",
+        default=DEFAULT_SERVICE_TOKEN,
+        help="must match ingestion's SERVICE_TOKEN; defaults to $SERVICE_TOKEN",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir) if args.data_dir else default_data_dir()
@@ -75,6 +88,7 @@ def main() -> None:
             ingestion_url=args.ingestion_url,
             speed=args.speed,
             chunk_seconds=args.chunk_seconds,
+            service_token=args.service_token,
         )
     )
 
