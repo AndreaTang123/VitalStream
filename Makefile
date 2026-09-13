@@ -1,6 +1,6 @@
 PY_SERVICES := libs/common services/ingestion services/feature_extraction services/config_service services/insight_service services/api services/device_simulator
 
-.PHONY: bootstrap test lint fmt up down frontend-install frontend-dev download-data
+.PHONY: bootstrap test lint fmt up down frontend-install frontend-dev frontend-build frontend-lint frontend-e2e download-data
 
 bootstrap:
 	@for svc in $(PY_SERVICES); do \
@@ -41,3 +41,13 @@ frontend-install:
 
 frontend-dev:
 	cd frontend && npm run dev
+
+frontend-build:
+	cd frontend && npm run build
+
+frontend-lint:
+	cd frontend && npm run lint && npx tsc --noEmit
+
+# Requires the full stack up + scripts/seed.py already run (README "本地启动").
+frontend-e2e:
+	cd frontend && npx playwright test

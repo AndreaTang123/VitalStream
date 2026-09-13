@@ -186,6 +186,27 @@ class ConfigStore:
             await session.commit()
             return {"rolled_back": version, "restored_active": restored_version}
 
+    async def list_versions(self, algo_name: str) -> list[dict]:
+        """week7 Step 8: the admin config page's version table — nothing
+        previously exposed every version's row (get_active only returns the
+        current stable/canary summary, audit_log is the event stream)."""
+        async with self._session_factory() as session:
+            result = await session.execute(
+                select(AlgoVersionORM)
+                .where(AlgoVersionORM.algo_name == algo_name)
+                .order_by(AlgoVersionORM.created_at.desc())
+            )
+            return [
+                {
+                    "algo_name": row.algo_name,
+                    "version": row.version,
+                    "status": row.status,
+                    "rollout_pct": row.rollout_pct,
+                    "created_at": row.created_at.isoformat(),
+                }
+                for row in result.scalars().all()
+            ]
+
     async def audit_log(self, algo_name: str) -> list[dict]:
         async with self._session_factory() as session:
             result = await session.execute(

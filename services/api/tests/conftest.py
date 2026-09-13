@@ -32,6 +32,27 @@ _FEATURES_TABLE_DDL = text(
     """
 )
 
+# insight_service-owned, same reasoning as _FEATURES_TABLE_DDL — see
+# routers/users.py's _DEVICE_INSIGHTS_QUERY comment.
+_DEVICE_INSIGHTS_TABLE_DDL = text(
+    """
+    CREATE TABLE device_insights (
+        id TEXT PRIMARY KEY,
+        device_id TEXT,
+        insight_text TEXT,
+        feature_snapshot TEXT,
+        model TEXT,
+        prompt_version TEXT,
+        cache_hit BOOLEAN,
+        latency_ms REAL,
+        generated_at TIMESTAMP,
+        prompt_tokens INTEGER,
+        completion_tokens INTEGER,
+        cost_usd REAL
+    )
+    """
+)
+
 
 @pytest_asyncio.fixture
 async def db_session():
@@ -43,6 +64,7 @@ async def db_session():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.execute(_FEATURES_TABLE_DDL)
+        await conn.execute(_DEVICE_INSIGHTS_TABLE_DDL)
 
     session_maker = async_sessionmaker(engine, expire_on_commit=False)
 

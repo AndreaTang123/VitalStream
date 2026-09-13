@@ -221,7 +221,11 @@ __marimo__/
 node_modules/
 .next/
 out/
+*.tsbuildinfo
 frontend/.env*.local
+frontend/playwright-report/
+frontend/test-results/
+frontend/blob-report/
 
 # Local env files
 .env

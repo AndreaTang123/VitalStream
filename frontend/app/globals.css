@@ -1,3 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 :root {
   --background: #0b1120;
   --foreground: #e2e8f0;
@@ -12,9 +16,19 @@ body {
   margin: 0;
   background: var(--background);
   color: var(--foreground);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
 }
 
 a {
   color: var(--accent);
+}
+
+/* Recharts renders inline SVG; keep it from overflowing its card on narrow
+   screens (Step 9) — ResponsiveContainer handles width, this guards height. */
+.recharts-wrapper {
+  max-width: 100%;
 }

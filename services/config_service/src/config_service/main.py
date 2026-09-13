@@ -82,6 +82,11 @@ async def rollback(algo_name: str, version: str, body: ActorIn = ActorIn()):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@app.get("/api/v1/config/feature-algo/{algo_name}/versions")
+async def list_versions(algo_name: str):
+    return await config_store.list_versions(algo_name)
+
+
 @app.get("/api/v1/config/feature-algo/{algo_name}/active")
 async def get_active(algo_name: str):
     try:

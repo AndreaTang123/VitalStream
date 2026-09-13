@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,6 +18,20 @@ router = APIRouter(prefix="/api/v1/features", tags=["features"])
 
 def _client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
+
+
+def _parse_iso(value: str | None, field_name: str) -> datetime | None:
+    # Same asyncpg-needs-a-real-datetime issue as users.py's `before` cursor
+    # — a raw ISO string bound against a timestamptz column works on sqlite
+    # but not real Postgres.
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"{field_name} must be an ISO 8601 timestamp"
+        ) from exc
 
 
 # `features` is owned/schema-managed by feature_extraction (feature_extraction/db.py),
@@ -49,7 +64,12 @@ async def get_device_features(
 ) -> list[dict]:
     result = await session.execute(
         _FEATURES_QUERY,
-        {"device_id": str(device_id), "start_ts": start_ts, "end_ts": end_ts, "limit": limit},
+        {
+            "device_id": str(device_id),
+            "start_ts": _parse_iso(start_ts, "start_ts"),
+            "end_ts": _parse_iso(end_ts, "end_ts"),
+            "limit": limit,
+        },
     )
     rows = result.mappings().all()
 

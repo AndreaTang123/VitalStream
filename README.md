@@ -67,11 +67,11 @@ services/
   insight_service/     Layer 2 — LLM-based insight generation, caching, eval, A/B testing
   api/                 Layer 3 — FastAPI backend: auth (OAuth2/JWT), RBAC, audit log
 libs/common/           Shared Pydantic schemas + telemetry helpers used across services
-frontend/              Layer 3 — Next.js dashboard (patient/coach views)
+frontend/              Layer 3 — Next.js dashboard (BFF auth, patient/coach/operator views)
 scripts/               scripts/seed.py — demo accounts/devices/coach grants for local dev
 infra/                 docker, prometheus, grafana, k6 load-test scripts, cloud VM bootstrap
 data/                  Dataset download script + local data cache
-docs/                  PRD and architecture docs
+docs/                  PRD, architecture docs, screenshots
 ```
 
 `services/api/migrations/` holds api's Alembic revisions (schema baseline +
@@ -87,7 +87,17 @@ make bootstrap                # create venvs and install each Python service in 
 services/api/.venv/bin/alembic -c services/api/alembic.ini upgrade head  # build api's Layer 3 tables
 services/api/.venv/bin/python -m scripts.seed                           # demo accounts + devices
 make test                     # run all service test suites
+
+# Frontend (Week 7) — separate toolchain (Node, not Python)
+cp frontend/.env.local.example frontend/.env.local
+make frontend-install
+make frontend-dev             # http://localhost:3000
 ```
+
+Sign in at `http://localhost:3000/login` with any seed account
+`scripts/seed.py` printed (`patient-a@vitalstream.dev`,
+`patient-b@vitalstream.dev`, `coach-c@vitalstream.dev`,
+`admin-o@vitalstream.dev`), password `password123` for all four.
 
 Datasets (WESAD, PPG-DaLiA) are *not* fetched by the steps above — they're
 only needed once a service actually replays them, so they're downloaded
@@ -117,6 +127,7 @@ services/insight_service/.venv/bin/python -m insight_service.consumer
 services/api/.venv/bin/uvicorn api.main:app --app-dir services/api/src --port 8000
 services/device_simulator/.venv/bin/python -m device_simulator.replay --subject S2 \
   --device-id <the S2 device id scripts/seed.py printed>
+cd frontend && npm run dev   # http://localhost:3000 — Week 7's UI on top of all of the above
 ```
 
 Since Week 6/Layer 3, `ingestion` rejects any `device_id` that isn't a row
@@ -351,6 +362,96 @@ curl -s localhost:8000/api/v1/audit-logs -H "Authorization: Bearer $COACH_ACCESS
 
 This is also the Week 8 demo recording's script for the "企业级交付" segment.
 
+### 前端架构 (Layer 3, Week 7)
+
+`frontend/` is a Next.js 14 App Router app — Tailwind for styling (hand-rolled
+primitives in `components/ui/`, not shadcn/ui: its CLI pulls component
+source from a registry over the network at generation time, which doesn't
+fit a non-interactive build environment; the components it would have
+generated are simple enough to write directly), TanStack Query for all
+server-state fetching/caching/polling, Recharts for the trend chart.
+
+**Auth is BFF-mode, not "call the API from the browser"**:
+
+```
+browser  ──(same-origin, cookie rides along)──▶  Next.js Route Handlers  ──(Authorization: Bearer)──▶  api (:8000)
+           /api/auth/{login,logout,me}
+           /api/proxy/[...path]  (everything else)
+```
+
+- `POST /api/auth/login` forwards to FastAPI, then writes the returned
+  access/refresh tokens into **httpOnly** cookies (`lib/server/cookies.ts`)
+  and returns only `{id, email, role, display_name}` to the browser — the
+  tokens themselves never reach client JS.
+- `GET/POST /api/proxy/[...path]` is the one door every client component
+  knocks on (`lib/apiFetch.ts`) for actual data. It reads the access-token
+  cookie, adds `Authorization`, and forwards to `api`. A `401` triggers one
+  single-flight refresh (`lib/server/refresh.ts` — a module-scope in-flight
+  promise, so five widgets 401-ing at once produces one refresh call, not
+  five racing ones) and a retry; a `403` passes straight through untouched
+  — conflating "your token is stale" with "you don't have access" would
+  retry-loop a permission denial forever.
+- **Why not `localStorage`**: an XSS payload can read `localStorage` but
+  can't read an httpOnly cookie — that's the whole point. The trade-offs
+  that come with it: an extra network hop (browser → Next → FastAPI instead
+  of straight to FastAPI), Next.js's server becomes a required component
+  (no static-only deploy), and CSRF has to be handled by `SameSite=Lax` +
+  only using `POST` for writes (a `GET` can't be CSRF'd into mutating
+  state). Week 6's CORS allowlist (`localhost:3000`) exists for Swagger/curl
+  debugging only — the app itself never makes a cross-origin request.
+- `middleware.ts` redirects a visitor with no refresh cookie away from
+  `/dashboard`, `/patients`, `/admin` before the page even renders, and
+  `components/RoleGate.tsx` shows a clean "Access denied" instead of a
+  403'd page full of broken widgets when a role doesn't match a route.
+  **Neither of these is a security boundary** — they only improve what an
+  already-logged-out or wrong-role visitor sees. The actual authorization
+  decision is made exactly once, in FastAPI, by Week 6's RBAC dependencies;
+  a request that bypassed the frontend entirely (raw curl) gets exactly the
+  same answer.
+
+**Types**: `lib/api-types.ts` is meant to be generated —
+`npm run gen:api` runs `openapi-typescript` against a live api service's
+`/openapi.json`. It ships hand-written for now (this environment couldn't
+run the full Postgres+api stack to generate against), matching the actual
+Pydantic response models in `services/api/src/api/routers/*.py` as of this
+week; regenerate it once you have the stack up, per the comment at the top
+of that file.
+
+**On-demand insight generation isn't a 202-then-poll flow.** Week 6's
+`POST /insights/generate` is synchronous (it reuses insight_service's Redis
+cache directly, same machinery the autonomous pipeline uses — see that
+router's comment) rather than publishing to Kafka and returning `202`. So
+`lib/hooks/useGenerateInsight.ts` just awaits the call, with a 60s client-side
+abort so a stuck LLM call can't spin the button forever — functionally the
+same guarantee ("don't wait/poll forever") as a bounded poll loop, adapted
+to how this endpoint actually works. The dashboard's insight feed itself
+*is* a merge of two sources (`api`'s on-demand `insights` table + Week 4's
+autonomous `device_insights` table, joined server-side in
+`GET /users/{id}/insights` — see that endpoint's comment), so a manually
+generated insight and the continuous background pipeline's output land in
+the same list either way.
+
+### 界面截图
+
+![Login](docs/screenshots/login.png)
+
+Only the login page is captured here — it's the one screen that renders
+without a live `api`/Postgres/Redpanda stack behind it, which this
+environment didn't have running. Once you have `docker compose up -d` +
+`scripts/seed.py` + the simulator running, capture the rest the same way
+(`npx playwright test` also exercises every screen below as a side effect):
+
+- Patient dashboard (`/dashboard`, logged in as `patient-a@vitalstream.dev`)
+  — insight card with cache/cost metadata, feature trend chart with a
+  gray-release version marker if you've run a canary.
+- Coach patient detail (`/patients/<patient-a-id>`, logged in as
+  `coach-c@vitalstream.dev`) — same components as the dashboard, reused.
+- Unauthorized access (`/patients/<patient-b-id>`, still as coach C) — the
+  "Access denied" state from `components/RoleGate.tsx`/the page's own 403
+  handling.
+- Audit log (`/admin/audit`, logged in as `admin-o@vitalstream.dev`) with
+  "仅看被拒绝" toggled on, showing the denied row from the previous screenshot.
+
 ### Observability (tracing)
 
 `docker compose up -d` includes Jaeger (`jaegertracing/all-in-one`) — UI at
@@ -438,5 +539,29 @@ Layers 1-2 (PRD milestones: Week 1-2 through Week 5) are working end-to-end:
   `tests/test_route_auth.py` / `tests/test_audit.py` are the permission-matrix
   and audit-trail tests backing the three acceptance-demo claims.
 
-Layer 3's frontend (Next.js) is Week 7 — Swagger UI (`/docs`) is this week's
-"UI". See [docs/PRD.md](docs/PRD.md) section 7 for the full milestone plan.
+- **Week 7**: `frontend` — a Next.js App Router dashboard, BFF-authenticated
+  (httpOnly cookies, never `localStorage`; see "前端架构" above for the
+  full rationale) against Week 6's `api`. Patient/coach share one dashboard
+  component (`components/PatientDashboard.tsx`) parameterized by `userId`,
+  so "coach views an authorized patient" is a reuse, not a second
+  implementation. Two backend gaps surfaced while wiring the frontend up
+  and were fixed this week rather than worked around: `GET
+  /coach/patients` didn't exist (coach_patient was write-only), and
+  `GET /users/{id}/insights`/`GET /features/{device_id}`'s `before`/
+  `start_ts`/`end_ts` cursor params were bound as raw strings against
+  timestamp columns — duck-typed into working on sqlite's test DB, but a
+  real bug against asyncpg/Postgres that unit tests hadn't caught (fixed via
+  explicit `datetime.fromisoformat` parsing + typed SQLAlchemy bind params,
+  see `tests/test_pagination.py`). `POST /insights/generate` also changed
+  from "caller supplies a hand-built features dict" to "caller supplies a
+  device_id, api pulls the latest per-feature-type value itself" — the
+  original shape had no answer for "what does a browser button actually
+  send." Three Playwright specs (`frontend/e2e/`) encode this week's three
+  acceptance-demo claims; they need the full stack up to run (not available
+  in the environment this was built in — see "界面截图" for what could and
+  couldn't be verified directly here).
+
+Layer 3's control plane (Week 6) and dashboard (Week 7) are both now real,
+not scaffolds. See [docs/PRD.md](docs/PRD.md) section 7 for the full
+milestone plan (Week 8: load testing, monitoring dashboards, CI/CD, demo
+recording).

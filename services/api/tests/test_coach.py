@@ -48,3 +48,31 @@ async def test_grant_rejects_role_mismatch(client, db_session):
     )
 
     assert response.status_code == 400
+
+
+async def test_list_coach_patients_scoped_to_grants(client, db_session):
+    coach = await make_user(db_session, role=Role.COACH, email="list-coach-x@example.com")
+    granted = await make_user(db_session, role=Role.PATIENT, email="list-granted@example.com")
+    ungranted = await make_user(db_session, role=Role.PATIENT, email="list-ungranted@example.com")
+
+    grant = await client.post(
+        "/api/v1/coach/patients",
+        json={"coach_id": str(coach.id), "patient_id": str(granted.id)},
+        headers=auth_headers(await make_user(db_session, role=Role.ADMIN, email="list-admin@example.com")),
+    )
+    assert grant.status_code == 201
+
+    response = await client.get("/api/v1/coach/patients", headers=auth_headers(coach))
+
+    assert response.status_code == 200
+    ids = {p["id"] for p in response.json()}
+    assert str(granted.id) in ids
+    assert str(ungranted.id) not in ids
+
+
+async def test_list_coach_patients_forbidden_for_patient(client, db_session):
+    patient = await make_user(db_session, role=Role.PATIENT, email="list-forbidden@example.com")
+
+    response = await client.get("/api/v1/coach/patients", headers=auth_headers(patient))
+
+    assert response.status_code == 403

@@ -66,43 +66,49 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: admin
     volumes: ["grafana_data:/var/lib/grafana"]
 
-  # Application services build from local Dockerfiles once implemented.
-  # Each builds with the repo root as context so it can COPY libs/common.
-  # Uncomment as each service becomes runnable.
-  #
-  # ingestion:
-  #   build: { context: ., dockerfile: services/ingestion/Dockerfile }
-  #   env_file: .env
-  #   ports: ["8001:8001"]
-  #   depends_on: [redpanda]
-  #
-  # feature_extraction:
-  #   build: { context: ., dockerfile: services/feature_extraction/Dockerfile }
-  #   env_file: .env
-  #   depends_on: [redpanda, postgres]
-  #
-  # config_service:
-  #   build: { context: ., dockerfile: services/config_service/Dockerfile }
-  #   env_file: .env
-  #   ports: ["8002:8002"]
-  #   depends_on: [postgres]
-  #
-  # insight_service:
-  #   build: { context: ., dockerfile: services/insight_service/Dockerfile }
-  #   env_file: .env
-  #   ports: ["8003:8003"]
-  #   depends_on: [redis, redpanda, postgres]  # redis+llm for on-demand HTTP; redpanda+postgres for the autonomous consumer.py
-  #
-  # api:
-  #   build: { context: ., dockerfile: services/api/Dockerfile }
-  #   env_file: .env
-  #   ports: ["8000:8000"]
-  #   depends_on: [postgres, insight_service]
-  #
-  # frontend:
-  #   build: ./frontend
-  #   ports: ["3000:3000"]
-  #   depends_on: [api]
+  # Application services build from local Dockerfiles. Each builds with the
+  # repo root as context so it can COPY libs/common. ingestion's Dockerfile
+  # entrypoint (services/ingestion/Dockerfile) still needs `--loop uvloop`
+  # wired in if you want that benchmark's exact numbers reproduced in a
+  # container — see README's benchmarking section.
+  ingestion:
+    build: { context: ., dockerfile: services/ingestion/Dockerfile }
+    env_file: .env
+    ports: ["8001:8001"]
+    depends_on: [redpanda, postgres]
+
+  feature_extraction:
+    build: { context: ., dockerfile: services/feature_extraction/Dockerfile }
+    env_file: .env
+    depends_on: [redpanda, postgres]
+
+  config_service:
+    build: { context: ., dockerfile: services/config_service/Dockerfile }
+    env_file: .env
+    ports: ["8002:8002"]
+    depends_on: [postgres]
+
+  insight_service:
+    build: { context: ., dockerfile: services/insight_service/Dockerfile }
+    env_file: .env
+    ports: ["8003:8003"]
+    depends_on: [redis, redpanda, postgres]  # redis+llm for on-demand HTTP; redpanda+postgres for the autonomous consumer.py
+
+  api:
+    build: { context: ., dockerfile: services/api/Dockerfile }
+    env_file: .env
+    ports: ["8000:8000"]
+    depends_on: [postgres, insight_service]
+
+  # week7 Step 10: BFF frontend — API_BASE_URL points at the api container
+  # by its compose service name, not localhost:8000 (that's only correct
+  # from the host machine running `npm run dev`, see frontend/.env.local).
+  frontend:
+    build: ./frontend
+    ports: ["3000:3000"]
+    environment:
+      API_BASE_URL: http://api:8000
+    depends_on: [api]
 
 volumes:
   redis_data:
