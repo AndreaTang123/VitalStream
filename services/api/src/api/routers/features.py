@@ -4,7 +4,7 @@ from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from sqlalchemy import text
+from sqlalchemy import DateTime, Uuid, bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.audit import write_audit_log
@@ -37,10 +37,13 @@ def _parse_iso(value: str | None, field_name: str) -> datetime | None:
 # `features` is owned/schema-managed by feature_extraction (feature_extraction/db.py),
 # not by api's own Alembic migrations — same physical Postgres, different
 # service's table, so this is a read-only raw-SQL query rather than an ORM
-# mapping api's migrations would think it owns.
+# mapping api's migrations would think it owns. `"window"` is quoted because
+# it's a reserved word in Postgres (SQL:2003 window functions) — unquoted it
+# was a syntax error ("syntax error at or near \"window\"") that sqlite,
+# with no such reserved word, never caught.
 _FEATURES_QUERY = text(
     """
-    SELECT feature_type, value, window, algo_version, window_end
+    SELECT feature_type, value, "window", algo_version, window_end
     FROM features
     WHERE device_id = :device_id
       AND (:start_ts IS NULL OR window_end >= :start_ts)
@@ -48,6 +51,18 @@ _FEATURES_QUERY = text(
     ORDER BY window_end DESC
     LIMIT :limit
     """
+    # Explicit types for every param that can ever be NULL (or that's
+    # compared against a Postgres-native `uuid` column) — asyncpg's prepare
+    # step infers each parameter's type from the query, and gives up
+    # ("could not determine data type of parameter") when the only context
+    # is `:param IS NULL OR ...` and the value passed happens to be NULL
+    # (the common case for end_ts, and start_ts on an unfiltered request).
+    # sqlite's test DB never catches this — it doesn't type-check bind
+    # params at prepare time the way a real Postgres connection does.
+).bindparams(
+    bindparam("device_id", type_=Uuid),
+    bindparam("start_ts", type_=DateTime(timezone=True)),
+    bindparam("end_ts", type_=DateTime(timezone=True)),
 )
 
 
@@ -65,7 +80,7 @@ async def get_device_features(
     result = await session.execute(
         _FEATURES_QUERY,
         {
-            "device_id": str(device_id),
+            "device_id": device_id,
             "start_ts": _parse_iso(start_ts, "start_ts"),
             "end_ts": _parse_iso(end_ts, "end_ts"),
             "limit": limit,

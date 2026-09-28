@@ -59,7 +59,17 @@ _DEVICE_INSIGHTS_QUERY = text(
     # holding a real Postgres-native uuid in production, so it doesn't need
     # the same treatment there — this bindparam only has to get `user_id`
     # right.
-).bindparams(bindparam("user_id", type_=Uuid)).columns(created_at=DateTime(timezone=True))
+    #
+    # `before` also needs an explicit type: asyncpg's prepare step asks
+    # Postgres to infer every parameter's type from the query, and
+    # `(:before IS NULL OR ... < :before)` gives it nothing to infer from
+    # when the value is actually NULL (the common case — no cursor on page
+    # one) — "could not determine data type of parameter $2" at runtime.
+    # sqlite never hit this because it doesn't type-check bind params at
+    # prepare time.
+).bindparams(
+    bindparam("user_id", type_=Uuid), bindparam("before", type_=DateTime(timezone=True))
+).columns(created_at=DateTime(timezone=True))
 
 
 @router.get("/{user_id}/insights")

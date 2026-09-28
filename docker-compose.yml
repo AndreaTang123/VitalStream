@@ -71,32 +71,81 @@ services:
   # entrypoint (services/ingestion/Dockerfile) still needs `--loop uvloop`
   # wired in if you want that benchmark's exact numbers reproduced in a
   # container — see README's benchmarking section.
+  #
+  # `env_file: .env` supplies everything that's the same in-container as on
+  # the host (JWT_SECRET_KEY, SERVICE_TOKEN, OPENAI_API_KEY, ...); the
+  # `environment:` block below each service OVERRIDES the handful of
+  # inter-service URLs that .env sets to `localhost:<port>` for host-based
+  # dev (`make bootstrap` + running each service's venv directly) — inside
+  # the compose network, "localhost" means the container itself, not its
+  # neighbor, so those have to become the other service's compose name.
   ingestion:
     build: { context: ., dockerfile: services/ingestion/Dockerfile }
     env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      # Same shared SQLAlchemy-style DSN as every other service — ingestion
+      # connects with raw asyncpg internally (device_registry.py), which
+      # doesn't understand the `+asyncpg` driver suffix on its own, so that
+      # module normalizes it rather than needing a special-cased DSN here.
+      POSTGRES_DSN: postgresql+asyncpg://vitalstream:vitalstream@postgres:5432/vitalstream
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     ports: ["8001:8001"]
-    depends_on: [redpanda, postgres]
+    depends_on: [redpanda, postgres, jaeger]
 
   feature_extraction:
     build: { context: ., dockerfile: services/feature_extraction/Dockerfile }
     env_file: .env
-    depends_on: [redpanda, postgres]
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      POSTGRES_DSN: postgresql+asyncpg://vitalstream:vitalstream@postgres:5432/vitalstream
+      CONFIG_SERVICE_BASE_URL: http://config_service:8002
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+    depends_on: [redpanda, postgres, jaeger]
 
   config_service:
     build: { context: ., dockerfile: services/config_service/Dockerfile }
     env_file: .env
+    environment:
+      POSTGRES_DSN: postgresql+asyncpg://vitalstream:vitalstream@postgres:5432/vitalstream
     ports: ["8002:8002"]
     depends_on: [postgres]
 
+  # insight_service ships two distinct entrypoints (see its Dockerfile /
+  # README "Insights pipeline"): `.main`, the RBAC-gated on-demand HTTP
+  # endpoint api's insights.generate calls, and `.consumer`, the autonomous
+  # Kafka consumer that turns feature_extraction's throttled
+  # features-extracted stream into `device_insights` rows — the data the
+  # frontend dashboard's trend/history views actually show. Both need to be
+  # running; the Dockerfile's own CMD only starts `.main`, so the consumer
+  # gets its own compose service on the same image with `command:` override.
   insight_service:
     build: { context: ., dockerfile: services/insight_service/Dockerfile }
     env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      POSTGRES_DSN: postgresql+asyncpg://vitalstream:vitalstream@postgres:5432/vitalstream
+      REDIS_URL: redis://redis:6379/0
     ports: ["8003:8003"]
-    depends_on: [redis, redpanda, postgres]  # redis+llm for on-demand HTTP; redpanda+postgres for the autonomous consumer.py
+    depends_on: [redis, redpanda, postgres]
+
+  insight_service_consumer:
+    build: { context: ., dockerfile: services/insight_service/Dockerfile }
+    command: ["python", "-m", "insight_service.consumer"]
+    env_file: .env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
+      POSTGRES_DSN: postgresql+asyncpg://vitalstream:vitalstream@postgres:5432/vitalstream
+      REDIS_URL: redis://redis:6379/0
+    depends_on: [redis, redpanda, postgres]
 
   api:
     build: { context: ., dockerfile: services/api/Dockerfile }
     env_file: .env
+    environment:
+      POSTGRES_DSN: postgresql+asyncpg://vitalstream:vitalstream@postgres:5432/vitalstream
+      INSIGHT_SERVICE_BASE_URL: http://insight_service:8003
+      CONFIG_SERVICE_BASE_URL: http://config_service:8002
     ports: ["8000:8000"]
     depends_on: [postgres, insight_service]
 

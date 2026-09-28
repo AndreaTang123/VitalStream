@@ -433,24 +433,44 @@ the same list either way.
 
 ### 界面截图
 
+All captured against the real stack (`docker compose up -d` + `scripts/seed.py`
++ a live simulator run + a real OpenAI key) — every number and sentence
+below is a genuine record, not a mock.
+
 ![Login](docs/screenshots/login.png)
 
-Only the login page is captured here — it's the one screen that renders
-without a live `api`/Postgres/Redpanda stack behind it, which this
-environment didn't have running. Once you have `docker compose up -d` +
-`scripts/seed.py` + the simulator running, capture the rest the same way
-(`npx playwright test` also exercises every screen below as a side effect):
+![Patient dashboard](docs/screenshots/patient-dashboard.png)
 
-- Patient dashboard (`/dashboard`, logged in as `patient-a@vitalstream.dev`)
-  — insight card with cache/cost metadata, feature trend chart with a
-  gray-release version marker if you've run a canary.
-- Coach patient detail (`/patients/<patient-a-id>`, logged in as
-  `coach-c@vitalstream.dev`) — same components as the dashboard, reused.
-- Unauthorized access (`/patients/<patient-b-id>`, still as coach C) — the
-  "Access denied" state from `components/RoleGate.tsx`/the page's own 403
-  handling.
-- Audit log (`/admin/audit`, logged in as `admin-o@vitalstream.dev`) with
-  "仅看被拒绝" toggled on, showing the denied row from the previous screenshot.
+Patient A's own view — the insight card's `GENERATED`/`PROMPT`/`CACHE`/`COST`
+row and the heart-rate trend chart are both reading real rows the Week 1-5
+pipeline produced (simulator → ingestion → feature_extraction →
+`features-extracted` → `insight_service.consumer` → `device_insights`),
+merged with any on-demand `生成洞察` clicks in the same list (see "前端架构").
+
+![Coach patient detail](docs/screenshots/coach-patient-detail.png)
+
+Coach C viewing authorized patient A — the *exact same* dashboard component
+as the screenshot above, just with `userId` swapped to the path param
+(`components/PatientDashboard.tsx`'s whole reason for existing).
+
+![Access denied](docs/screenshots/access-denied.png)
+
+Coach C hand-editing the URL to patient B's id — cleanly denied by
+`api`'s resource-level RBAC (Week 6), surfaced as a clean page instead of a
+stack of broken 403'd widgets (`app/(app)/patients/[id]/page.tsx`).
+
+![Audit log, denied filter](docs/screenshots/audit-log-denied.png)
+
+The access attempt above, found by admin-o filtering `/admin/audit` to
+"仅看被拒绝" — actor, action, target, and source IP all legible, `denied`
+in red. This and the previous screenshot together are the Week 7 acceptance
+demo's second claim end to end.
+
+![Admin config](docs/screenshots/admin-config.png)
+
+`heart_rate`'s real version history from earlier gray-release testing
+(`v1` active, `v2-naive-wideband` retired via rollback) — same data Week 3's
+`config_service` produced, now driven from the UI instead of curl.
 
 ### Observability (tracing)
 
@@ -557,11 +577,46 @@ Layers 1-2 (PRD milestones: Week 1-2 through Week 5) are working end-to-end:
   device_id, api pulls the latest per-feature-type value itself" — the
   original shape had no answer for "what does a browser button actually
   send." Three Playwright specs (`frontend/e2e/`) encode this week's three
-  acceptance-demo claims; they need the full stack up to run (not available
-  in the environment this was built in — see "界面截图" for what could and
-  couldn't be verified directly here).
+  acceptance-demo claims.
 
-Layer 3's control plane (Week 6) and dashboard (Week 7) are both now real,
-not scaffolds. See [docs/PRD.md](docs/PRD.md) section 7 for the full
-milestone plan (Week 8: load testing, monitoring dashboards, CI/CD, demo
-recording).
+  **Live-verified end to end**, not just built: against the real dockerized
+  stack (`docker compose up -d`, `alembic upgrade head`, `scripts/seed.py`,
+  a real simulator replay, a real OpenAI key), all three acceptance-demo
+  claims were reproduced in an actual browser — see "界面截图" for the
+  screenshots. Getting there past the build surfaced four more real bugs,
+  none of which sqlite-backed unit tests could have caught (all fixed, see
+  the commit history and the relevant files' comments for each):
+  `alembic.ini`'s `script_location`/`prepend_sys_path` were plain relative
+  paths, so `alembic -c services/api/alembic.ini upgrade head` silently
+  resolved `migrations` against the caller's cwd instead of the ini file's
+  own directory (fixed with Alembic's `%(here)s` token); `UserORM.role`/
+  `DeviceORM.status` are Python `StrEnum`s, and SQLAlchemy's `Enum` type
+  defaults to storing the member *name* ("PATIENT") rather than `.value`
+  ("patient") — invisible on sqlite (no real enum type to reject the
+  mismatch) but a hard `InvalidTextRepresentationError` against Postgres's
+  actual `CREATE TYPE ... AS ENUM('patient', ...)` (fixed with
+  `values_callable`); two raw-SQL queries had a `:param IS NULL OR ...`
+  clause whose parameter asyncpg couldn't type-infer when actually NULL —
+  "could not determine data type of parameter" (fixed with explicit
+  SQLAlchemy `bindparam(..., type_=...)` on every such param); and
+  `features.py`'s `SELECT ... window ...` was a syntax error against real
+  Postgres because `window` is a reserved word there (fixed by quoting it).
+  Separately, wiring `frontend`/`api`/`ingestion`/etc. into
+  `docker-compose.yml` needed each service's inter-container URLs
+  (`POSTGRES_DSN`, `KAFKA_BOOTSTRAP_SERVERS`, `*_SERVICE_BASE_URL`)
+  overridden from `.env`'s host-dev `localhost:<port>` values to the
+  compose network's service names, ingestion's raw-asyncpg `POSTGRES_DSN`
+  needed the SQLAlchemy `+asyncpg` driver suffix stripped (it uses asyncpg
+  directly, not through SQLAlchemy, and asyncpg's own DSN parser rejects
+  that suffix), and `insight_service`'s Dockerfile only ever started its
+  on-demand HTTP API — the autonomous Kafka consumer that actually
+  populates `device_insights` needed its own compose service on the same
+  image with a `command:` override. None of this is exotic; it's the
+  standard gap between "the code is correct" and "the code has touched a
+  real Postgres/compose network," and it's exactly the kind of gap `git log`
+  and this section exist to be honest about.
+
+Layer 3's control plane (Week 6) and dashboard (Week 7) are both now real
+and live-verified, not scaffolds. See [docs/PRD.md](docs/PRD.md) section 7
+for the full milestone plan (Week 8: load testing, monitoring dashboards,
+CI/CD, demo recording).

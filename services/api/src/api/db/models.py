@@ -22,6 +22,18 @@ from vitalstream_common.schemas import DeviceStatus, Role
 
 from api.db.base import Base
 
+# Role/DeviceStatus are StrEnums (member value IS the on-the-wire string,
+# e.g. Role.PATIENT.value == "patient"). SQLAlchemy's Enum type defaults to
+# storing the Python member *name* ("PATIENT"), not `.value` — harmless on
+# sqlite (no real enum type, just a VARCHAR, so writes/reads stay internally
+# consistent) but a hard failure against Postgres's actual `CREATE TYPE ...
+# AS ENUM ('patient', ...)` from the Alembic migration, which only accepts
+# the lowercase values. `values_callable` makes both dialects agree.
+_role_enum = SAEnum(Role, name="role", values_callable=lambda enum_cls: [e.value for e in enum_cls])
+_device_status_enum = SAEnum(
+    DeviceStatus, name="device_status", values_callable=lambda enum_cls: [e.value for e in enum_cls]
+)
+
 
 class UserORM(Base):
     __tablename__ = "users"
@@ -29,7 +41,7 @@ class UserORM(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     email: Mapped[str] = mapped_column(String, unique=True, index=True)
     hashed_password: Mapped[str] = mapped_column(String)
-    role: Mapped[Role] = mapped_column(SAEnum(Role, name="role"))
+    role: Mapped[Role] = mapped_column(_role_enum)
     display_name: Mapped[str | None] = mapped_column(String, nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -43,7 +55,7 @@ class DeviceORM(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), index=True)
     device_type: Mapped[str] = mapped_column(String)
-    status: Mapped[DeviceStatus] = mapped_column(SAEnum(DeviceStatus, name="device_status"))
+    status: Mapped[DeviceStatus] = mapped_column(_device_status_enum)
     bound_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     user: Mapped[UserORM] = relationship(back_populates="devices")

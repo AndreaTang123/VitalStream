@@ -21,9 +21,23 @@ from ingestion.config import settings
 logger = logging.getLogger(__name__)
 
 
+def _asyncpg_dsn(dsn: str) -> str:
+    """Every other service here goes through SQLAlchemy, which needs the
+    `postgresql+asyncpg://` driver-qualified form — so that's what
+    `POSTGRES_DSN` is set to everywhere it's shared (`.env`, docker-compose).
+    This service talks to Postgres with raw asyncpg instead (no ORM/engine
+    needed for a "is this id known" cache), and asyncpg's own DSN parser
+    rejects the `+asyncpg` suffix outright ("invalid DSN: scheme is expected
+    to be either postgresql or postgres"). Normalize here instead of relying
+    on every deployment to remember this one service wants a different
+    format.
+    """
+    return dsn.replace("postgresql+asyncpg://", "postgresql://")
+
+
 class DeviceRegistry:
     def __init__(self, dsn: str) -> None:
-        self._dsn = dsn
+        self._dsn = _asyncpg_dsn(dsn)
         self._pool: asyncpg.Pool | None = None
         self._known: set[str] = set()
         self._refresh_task: asyncio.Task | None = None
