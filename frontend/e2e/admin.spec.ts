@@ -12,7 +12,7 @@ test("operator rolls back a config version and sees it audited", async ({ page }
   const rollbackButtons = page.getByRole("button", { name: "Rollback" });
   test.skip(
     (await rollbackButtons.count()) === 0,
-    "no non-retired version to roll back — register/publish one first (README '认证与权限' curl flow)",
+    "no non-retired version to roll back — register/publish one first (README 'Deep Dives → Gray release mechanics' curl flow)",
   );
 
   await rollbackButtons.first().click();

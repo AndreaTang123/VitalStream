@@ -1,168 +1,418 @@
 # VitalStream
 
-Distributed Wearable Health Insights Platform — a personal engineering project that
-takes high-frequency wearable signals (heart rate, HRV, sleep, activity) from ingestion
-through feature extraction, LLM-based health insight generation, and a role-aware
-full-stack delivery layer.
+*A distributed platform that ingests wearable PPG signals over asyncio, extracts
+heart-rate features behind a canary-controlled gray-release pipeline, generates
+evaluated LLM health insights, and serves them through a JWT/RBAC-secured
+FastAPI + Next.js full-stack app — with an audit log for every cross-user access.*
 
-See [docs/PRD.md](docs/PRD.md) for the full product requirements doc and
-[docs/architecture.md](docs/architecture.md) for the system diagram.
+[![CI](https://github.com/AndreaTang123/VitalStream/actions/workflows/ci.yml/badge.svg)](https://github.com/AndreaTang123/VitalStream/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
+![Next.js](https://img.shields.io/badge/next.js-14-black?logo=next.js&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-100%20passing-brightgreen)
+
+Real PPG-DaLiA wearable data in, real OpenAI-generated advice out, real
+Postgres-backed accounts and audit trail — nothing in this repo is mocked.
+See [docs/PRD.md](docs/PRD.md) for the full product requirements doc.
+
+![Patient dashboard](docs/screenshots/patient-dashboard.png)
+
+## Highlights
+
+- **~4.8x throughput / ~6.5x P50 latency** on the ingestion path from fixing one
+  bug (a `send_and_wait()` call that accidentally blocked every HTTP response
+  on a Kafka ack) — 384.9 → 1841.8 req/s, P50 25.8ms → 4.0ms, same machine,
+  same concurrency. [Full methodology, including three dead ends →](benchmarks/results.md)
+- **Hash-bucketed canary releases with one-command rollback** for the feature-
+  extraction algorithm — SHA-256(`device_id`) mod 100 against the canary's
+  `rollout_pct`, so a device stays on one version for the life of a rollout
+  instead of flip-flopping per request.
+- **A measured prompt A/B, not a guess**: grounded_rate **18.2% → 95.5%**
+  (v1 → v2) on a 22-case hand-written eval set, for a real +32% latency /
+  +40% cost trade-off — and the fix that got there wasn't the failure mode
+  the project expected going in. [Report →](benchmarks/week5_eval_report.md)
+- **LLM response caching whose payoff is measured, not assumed**: 0.2% hit
+  rate replaying one continuously-varying device, 56.9% across a 40-device
+  fleet resting near the same heart rate — same mechanism, opposite
+  conclusion depending on traffic shape.
+- **Two-layer RBAC (role + resource) with a real audit trail**, live-verified
+  end to end in a browser: a coach reading an authorized patient's data
+  succeeds and is logged; reading an unauthorized patient's data by hand-
+  editing the URL is cleanly denied *and* the denial itself shows up in the
+  audit log's "denied only" filter. [Screenshots below ↓](#interface-screenshots)
+- **BFF auth**: access/refresh JWTs live only in httpOnly cookies the browser
+  can't read — the Next.js server, not client JS, holds every token.
+- **92% test coverage** on the `api` service (100 tests passing across all 7
+  Python packages), including a route-sweep meta-test that fails the build
+  if any future endpoint forgets its auth dependency.
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    SIM["device_simulator<br/>(replays real PPG-DaLiA)"] -->|"POST /devices/{id}/signals<br/>+ X-Service-Token"| ING
+
+    subgraph L1["Layer 1 — ingestion & feature extraction"]
+        ING["ingestion<br/>asyncio + uvloop"]
+        KAFKA[("Redpanda<br/>raw-signals topic")]
+        FE["feature_extraction<br/>NumPy/SciPy bandpass + peak detection"]
+        CFGSVC["config_service<br/>validate → gray release → rollback"]
+        PGF[("Postgres<br/>features")]
+        KAFKA2[("Redpanda<br/>features-extracted<br/>(throttled, aggregated)")]
+    end
+
+    subgraph L2["Layer 2 — AI insight generation"]
+        CONSUMER["insight_service.consumer<br/>Redis-cached, LLM-backed"]
+        REDIS[("Redis<br/>response cache")]
+        PGI[("Postgres<br/>device_insights")]
+        LLM(["OpenAI API"])
+    end
+
+    subgraph L3["Layer 3 — full-stack delivery"]
+        API["api<br/>FastAPI · JWT/OAuth2 · RBAC · audit log"]
+        PGA[("Postgres<br/>users / devices / coach_patient /<br/>insights / audit_logs")]
+        FRONT["frontend<br/>Next.js · BFF cookie auth"]
+    end
+
+    ING -->|device_id-keyed| KAFKA
+    KAFKA --> FE
+    CFGSVC -. active version .-> FE
+    FE --> PGF
+    FE -->|per-device throttle| KAFKA2
+    KAFKA2 --> CONSUMER
+    CONSUMER <--> REDIS
+    CONSUMER -.->|cache miss| LLM
+    CONSUMER --> PGI
+
+    API <--> PGA
+    API -->|on-demand generate, RBAC-gated| CONSUMER
+    API -->|read features| PGF
+    API -->|read device_insights| PGI
+    API -->|register/canary/rollback, RBAC-gated| CFGSVC
+    FRONT <-->|"/api/proxy/*, httpOnly cookie"| API
+
+    style LLM fill:#1a1a2e,stroke:#888,color:#fff
 ```
-device_simulator (replays WESAD/PPG-DaLiA)
-      │  HTTP (asyncio)
-      ▼
-┌─────────────────┐      ┌───────────────────┐      ┌──────────────────────┐
-│ ingestion        │ ──▶ │ Redpanda           │ ──▶ │ feature_extraction    │
-│ (asyncio+uvloop) │      │ (Kafka protocol)   │      │ (NumPy/SciPy,         │
-└─────────────────┘      └───────────────────┘      │  gray-release aware)  │
-                                                       └──────────┬───────────┘
-                                  ┌────────────────────┬──────────┴───────────┐
-                                  ▼                    ▼ (throttled, aggregated snapshot)
-                       ┌────────────────┐   ┌────────────────────┐
-                       │ Postgres        │   │ Redpanda            │
-                       │ features table  │   │ features-extracted  │
-                       │ (TimescaleDB    │   │  topic              │
-                       │  hypertable:    │   └──────────┬──────────┘
-                       │  Week 8+)       │              ▼
-                       └────────────────┘   ┌────────────────────┐
-                                             │ insight_service     │
-                                             │ .consumer (LLM,     │
-                                             │  Redis cache) →     │
-                                             │  device_insights    │
-                                             └──────────┬──────────┘
-                                                         │
-                                       (separately: a logged-in user can also
-                                        trigger .main's on-demand endpoint)
-                                                         ▼
-                                              ┌────────────────────┐
-                                              │ api (FastAPI)       │
-                                              │ JWT/OAuth2 + RBAC   │
-                                              │ + audit log         │
-                                              └──────────┬──────────┘
-                                                         ▼
-                                              ┌────────────────────┐
-                                              │ frontend (Next.js)  │
-                                              └────────────────────┘
 
-config_service (FastAPI+Pydantic) controls feature_extraction algorithm versions
-(validate → gray release → rollback) — feature_extraction falls back to a
-default algo_version if config_service isn't running, so Layer 1 doesn't
-depend on it being up.
+<details>
+<summary>Sequence: one signal's trip from device to screen</summary>
 
-Cross-cutting: OpenTelemetry (tracing), Prometheus + Grafana (metrics), Docker,
-GitHub Actions (CI/CD).
+```mermaid
+sequenceDiagram
+    participant Sim as device_simulator
+    participant Ing as ingestion
+    participant K as Redpanda
+    participant FE as feature_extraction
+    participant PG as Postgres
+    participant Cons as insight_service.consumer
+    participant LLM as OpenAI
+    participant API as api
+    participant UI as frontend
+
+    Sim->>Ing: POST /devices/{id}/signals
+    Ing->>K: produce raw-signals (key=device_id)
+    K->>FE: consume
+    FE->>FE: bandpass filter + peak detection (8s window)
+    FE->>PG: INSERT features
+    FE->>K: produce features-extracted (throttled snapshot)
+    K->>Cons: consume InsightRequest
+    Cons->>Cons: normalize snapshot -> Redis cache key
+    alt cache hit
+        Cons->>Cons: skip LLM ($0, ~1ms)
+    else cache miss
+        Cons->>LLM: chat completion
+        LLM-->>Cons: insight text + token usage
+    end
+    Cons->>PG: INSERT device_insights (cache_hit, cost_usd, latency_ms)
+    UI->>API: GET /api/proxy/users/{id}/insights (cookie)
+    API->>PG: SELECT (merged on-demand + autonomous rows)
+    API-->>UI: insight + trend data
 ```
 
-## Repo layout
+</details>
+
+Cross-cutting: OpenTelemetry distributed tracing (Jaeger), Docker Compose for
+every service, GitHub Actions CI (lint + test each Python package, lint +
+build the frontend). Everything in the diagram is actually implemented and
+wired into `docker-compose.yml` — nothing here is aspirational; see
+[Limitations](#limitations--future-work) for what's explicitly *not* built
+yet (Prometheus/Grafana metrics, k6 load testing, TimescaleDB).
+
+## Results
+
+**Ingestion throughput** (same machine, concurrency=10, 15s, `benchmarks/load_test.py`):
+
+| | RPS | P50 | P95 | P99 |
+|---|---|---|---|---|
+| Before fix | 384.9 | 25.77 ms | 28.47 ms | 29.79 ms |
+| After fix | **1841.8** | **3.96 ms** | 14.82 ms | 27.39 ms |
+
+The fix was replacing a blocking `send_and_wait()` with fire-and-forget
+`send()` in the Kafka producer — not uvloop, which measured no benefit on
+its own on this workload. [Why, and three benchmarking dead ends along the way →](benchmarks/results.md)
+
+**LLM insight quality, prompt v1 vs v2** (22 hand-written cases, gpt-4o-mini):
+
+| | grounded_rate | hallucination_rate | avg latency | avg cost |
+|---|---|---|---|---|
+| v1 | 18.2% (4/22) | 4.5% (1/22) | 960.7 ms | $0.000052 |
+| v2 | **95.5% (21/22)** | **0.0% (0/22)** | 1272.9 ms | $0.000073 |
+
+v1's real failure mode wasn't hallucination (it was already near-zero) — it
+was *groundedness*: 19/22 failures were generic wellness filler that never
+restated the actual number it was given. [Full report, including a bug the eval process itself caught →](benchmarks/week5_eval_report.md)
+
+**Redis cache hit rate, by traffic shape** (real replay, real Redis/Postgres):
+
+| scenario | rows | hit rate | cache-hit latency | cache-miss latency |
+|---|---|---|---|---|
+| One device, full PPG-DaLiA replay | 514 | 0.2% | 0.41 ms | ~977 ms |
+| 40 synthetic devices near the same heart rate | 130 | **56.9%** | 0.41 ms | ~977 ms |
+
+Same mechanism, opposite headline number — the cache pays off at fleet
+scale, not from one device running longer.
+
+## Key Design Decisions
+
+Six choices worth defending in an interview, each: what, why, what it costs.
+
+- **Redpanda + aiokafka, `device_id` as the Kafka message key** (raw-signals,
+  features, and features-extracted topics all key by it). Guarantees
+  per-device ordering within a partition without a dedicated per-device
+  queue. Cost: partition count caps device-level parallelism.
+- **Hash-bucketed gray release, not random sampling.** `SHA256(device_id) %
+  100 < rollout_pct` routes a device to canary or stable. A given device
+  stays on the same version for the life of a rollout (reproducible bugs,
+  clean A/B attribution) instead of flip-flopping every request. Cost: a
+  slightly uneven real split at small device counts (law of large numbers).
+- **Cache key = feature snapshot rounded to 2dp + prompt version + model.**
+  Two floating-point-adjacent snapshots (72.001 vs 72.002 bpm) collide on
+  purpose. Cost: a cache hit is an *approximation* match, not exact —
+  acceptable for wellness copy, not for anything requiring precision.
+- **`POST /insights/generate` is synchronous, not a `202`-then-poll queue.**
+  It reuses `insight_service`'s Redis cache directly (same machinery the
+  autonomous pipeline uses), so a repeat click on an unchanged snapshot is a
+  ~1ms cache hit, not a fresh LLM call. Cost: a genuine cache miss blocks the
+  HTTP response for the LLM's real latency (~1-2s) — bounded client-side by
+  a 60s abort so a stuck call can't hang the button forever.
+- **Two-layer RBAC; unauthorized access returns 403, not 404.** Role-level
+  (`require_role`) gates *which endpoints* a role can call; resource-level
+  (`authorize_user_access`/`authorize_device_access`) gates *which rows*,
+  backed by a real `coach_patient` grants table — without it, "coach sees
+  their patients" silently degrades into "coach sees everyone." 403 (not a
+  404 that disguises "forbidden" as "doesn't exist") was chosen because this
+  RBAC serves three *known* internal roles collaborating, not a public API
+  defending against user-ID enumeration by strangers.
+- **Audit log written synchronously in the same transaction, never queued.**
+  These are low-frequency endpoints (config changes, cross-user reads,
+  auth events) where a dropped audit row is a compliance problem — unlike
+  the data plane, where Kafka's async decoupling is worth the durability
+  trade-off.
+- **Auth tokens live in httpOnly cookies via a Next.js BFF, never
+  `localStorage`.** An XSS payload can read `localStorage`; it can't read an
+  httpOnly cookie. Cost: an extra network hop (browser → Next.js → FastAPI)
+  and Next.js's server becomes a required component, not an optional static
+  shell.
+
+## Quick Start
+
+**Prerequisites**: Docker, Python 3.12, Node 20.
+
+```bash
+git clone https://github.com/AndreaTang123/VitalStream.git && cd VitalStream
+cp .env.example .env
+cp frontend/.env.local.example frontend/.env.local
+
+docker compose up -d                                                      # Postgres, Redpanda, Redis, Jaeger, Prometheus, Grafana
+make bootstrap                                                            # create each service's venv
+services/api/.venv/bin/alembic -c services/api/alembic.ini upgrade head   # api's schema
+services/api/.venv/bin/python -m scripts.seed                             # 4 demo accounts + 2 devices
+
+make frontend-install && make frontend-dev                                # http://localhost:3000
+```
+
+`docker compose up -d` also builds and starts every application service
+(`ingestion`, `feature_extraction`, `config_service`, `insight_service` +
+its Kafka consumer, `api`) — see [docker-compose.yml](docker-compose.yml).
+To replay real data through the pipeline, grab a PPG-DaLiA subject
+([data/README.md](data/README.md)) and:
+
+```bash
+services/device_simulator/.venv/bin/python -m device_simulator.replay --subject S2 \
+  --device-id <the S2 device id scripts/seed.py printed> \
+  --ingestion-url http://localhost:8001 --service-token <SERVICE_TOKEN from .env>
+```
+
+Sign in at **http://localhost:3000/login**:
+
+| Email | Role | Password |
+|---|---|---|
+| `patient-a@vitalstream.dev` | patient | `password123` |
+| `patient-b@vitalstream.dev` | patient | `password123` |
+| `coach-c@vitalstream.dev` (authorized for patient A only) | coach | `password123` |
+| `admin-o@vitalstream.dev` | admin/operator | `password123` |
+
+Other useful addresses once everything's up: `api` docs at
+[localhost:8000/docs](http://localhost:8000/docs), Jaeger traces at
+[localhost:16686](http://localhost:16686), Grafana at
+[localhost:3001](http://localhost:3001) (scrape targets not wired yet — see
+[Limitations](#limitations--future-work)).
+
+## Interface Screenshots
+
+All captured against the real running stack — every number and sentence is
+a genuine record, not mocked.
+
+![Coach patient detail](docs/screenshots/coach-patient-detail.png)
+*Coach C viewing authorized patient A — the exact same dashboard component
+patient A sees on their own login, just parameterized by `userId`.*
+
+![Access denied](docs/screenshots/access-denied.png)
+*Coach C hand-editing the URL to patient B's id — cleanly denied by
+resource-level RBAC.*
+
+![Audit log, denied filter](docs/screenshots/audit-log-denied.png)
+*The access attempt above, found by the admin filtering the audit log to
+"denied only" — actor, action, target, and source IP all legible.*
+
+![Admin config](docs/screenshots/admin-config.png)
+*`heart_rate`'s real version history from gray-release testing — `v1`
+active, `v2-naive-wideband` retired via rollback.*
+
+## Observability
+
+`docker compose up -d` includes Jaeger — UI at
+[localhost:16686](http://localhost:16686). `ingestion` and
+`feature_extraction` both export spans via OTLP/HTTP, and they're *one
+trace* across two processes: `ingestion` injects the current span's W3C
+trace context into the outgoing Kafka message headers, and
+`feature_extraction`'s consumer loop extracts it back out and continues the
+same trace instead of starting a new one:
+
+```
+POST /api/v1/devices/{id}/signals   (ingestion, HTTP)
+└─ consume raw-signal               (feature_extraction, Kafka)
+   ├─ compute feature (bandpass+peaks)
+   ├─ produce features-topic
+   └─ write features row (postgres)
+```
+
+Prometheus/Grafana containers run (`docker-compose.yml`), but no service
+exports a `/metrics` endpoint yet — the scrape config
+(`infra/prometheus/prometheus.yml`) is honestly labeled `TODO` rather than
+silently absent. This is explicit Week 8 scope; see
+[Limitations](#limitations--future-work).
+
+## Security
+
+RBAC and auth are covered in depth under [Deep Dives](#deep-dives) below.
+The baseline checklist, walked and checked off against the real code:
+
+- [x] `JWT_SECRET_KEY`/`SERVICE_TOKEN` come from environment variables;
+      `.env` is gitignored, no real secret is committed.
+- [x] Token decode pins an explicit algorithm allowlist
+      (`algorithms=[settings.jwt_algorithm]`) — rejects forged `alg: none`
+      tokens; `exp` is checked automatically.
+- [x] Access tokens expire in 30 minutes; refresh tokens (7 days) are
+      revocable via a `refresh_tokens` table — a bare stateless JWT can't be.
+- [x] Passwords hashed with bcrypt; login returns an identical error for
+      "no such user" and "wrong password" (no user enumeration).
+- [x] Every non-public route carries an auth dependency — enforced by a
+      test that walks `app.routes`, not a manual audit
+      (`tests/test_route_auth.py`).
+- [x] CORS allows only `http://localhost:3000`, never `["*"]`.
+- [x] Login has basic rate limiting (in-process fixed window — a
+      single-instance deployment doesn't need Redis for this).
+- [x] Responses use dedicated `UserOut`/`DeviceOut` Pydantic models — ORM
+      objects (and `hashed_password`) are never serialized directly.
+- [x] All database access is parameterized; the one raw-SQL query
+      (`routers/features.py`, needed because that table belongs to a
+      different service's schema) uses SQLAlchemy `text()` with named,
+      explicitly-typed bind parameters, never f-string interpolation.
+- [x] Auth tokens live only in httpOnly cookies (BFF pattern) — never
+      `localStorage`, never readable by an XSS payload.
+
+## Testing & CI
+
+- **100 tests passing** across 7 Python packages (`make test`); `api` alone
+  has 42, at 92% statement coverage (`pytest --cov`).
+- The permission matrix is the highest-value suite:
+  `services/api/tests/test_rbac.py` parametrizes 3 roles × own/authorized/
+  unauthorized across the read endpoints; `test_route_auth.py` is a
+  structural sweep that fails the build if a future endpoint forgets its
+  auth dependency; `test_audit.py` asserts cross-user reads *do* write an
+  audit row and self-reads *don't*.
+- 4 Playwright specs (`frontend/e2e/`) encode the three end-to-end
+  acceptance claims (patient sees real data + generates an insight; coach
+  is authorized/denied correctly; operator's rollback shows up in the
+  audit log) — they need the full stack + seed data running, so they're
+  not yet in CI (`make frontend-e2e` runs them locally).
+- CI (`.github/workflows/ci.yml`) runs on every push/PR: lint + pytest for
+  each Python package, `next lint` + `next build` for the frontend.
+
+## Project Structure
 
 ```
 services/
   ingestion/           Layer 1 — asyncio + uvloop signal ingestion, produces to Redpanda
   feature_extraction/  Layer 1 — NumPy/SciPy windowed feature extraction, gray-release aware
   config_service/      Layer 1 — versioned config: validate / gray release / rollback
-  device_simulator/    Replays a real WESAD/PPG-DaLiA subject against the ingestion API
-  insight_service/     Layer 2 — LLM-based insight generation, caching, eval, A/B testing
-  api/                 Layer 3 — FastAPI backend: auth (OAuth2/JWT), RBAC, audit log
+  device_simulator/    Replays a real PPG-DaLiA subject against the ingestion API
+  insight_service/     Layer 2 — LLM insight generation: on-demand HTTP + autonomous Kafka consumer, caching, eval, A/B testing
+  api/                 Layer 3 — FastAPI backend: OAuth2/JWT auth, two-layer RBAC, audit log, Alembic migrations
 libs/common/           Shared Pydantic schemas + telemetry helpers used across services
-frontend/              Layer 3 — Next.js dashboard (BFF auth, patient/coach/operator views)
+frontend/              Layer 3 — Next.js dashboard: BFF cookie auth, patient/coach/operator views
 scripts/               scripts/seed.py — demo accounts/devices/coach grants for local dev
-infra/                 docker, prometheus, grafana, k6 load-test scripts, cloud VM bootstrap
-data/                  Dataset download script + local data cache
-docs/                  PRD, architecture docs, screenshots
+infra/                 Prometheus/Grafana configs, k6 load-test script (Week 8), cloud VM bootstrap
+data/                  Dataset download script + local data cache (gitignored)
+docs/                  PRD, architecture notes, screenshots
 ```
 
-`services/api/migrations/` holds api's Alembic revisions (schema baseline +
-Week 6's RBAC/audit tables) — see "认证与权限" below for what it does and
-doesn't own.
+## Limitations & Future Work
 
-## Quick start
+Scoped out deliberately, per [PRD §2.2](docs/PRD.md) and §10 — listed here
+instead of left implicit, because knowing what's *not* built is as much a
+signal of engineering judgment as what is:
 
-```bash
-cp .env.example .env
-docker compose up -d          # Kafka/Redis, Postgres, TimescaleDB, Prometheus, Grafana
-make bootstrap                # create venvs and install each Python service in editable mode
-services/api/.venv/bin/alembic -c services/api/alembic.ini upgrade head  # build api's Layer 3 tables
-services/api/.venv/bin/python -m scripts.seed                           # demo accounts + devices
-make test                     # run all service test suites
+- **No medical-grade accuracy claim.** Generated advice is general
+  lifestyle text, not clinical guidance — the PRD is explicit about this.
+- **No real device or hospital data.** Every signal replayed is from public
+  research datasets (PPG-DaLiA), never a real patient.
+- **No production HA.** Single-instance deployment; the in-process rate
+  limiter and refresh-token single-flight both assume one process.
+- **Prometheus/Grafana metrics are not wired up yet** — containers run, but
+  no service exports `/metrics`. Distributed tracing (Jaeger) *is* real and
+  working; metrics are the gap.
+- **Load testing so far uses a hand-rolled `httpx`/asyncio script**
+  (`benchmarks/load_test.py`), not the k6 scenario scaffolded in
+  `infra/k6/load_test.js`. The custom script was what actually let the
+  investigation isolate which layer (event loop vs. batching window vs.
+  client connection pool) was the real bottleneck at each step — see
+  [benchmarks/results.md](benchmarks/results.md) for that walkthrough. A
+  proper multi-VU k6 sweep is Week 8 scope.
+- **No TimescaleDB.** Raw/derived signals live in plain Postgres; at this
+  project's data volume, a hypertable would be premature optimization.
+- **No CI for the Playwright E2E suite** — it needs a live seeded stack,
+  which GitHub Actions doesn't currently provision.
+- **HIPAA/GDPR**: only the *engineering practices* associated with
+  compliance (audit logging, RBAC, encrypted-in-transit auth) are
+  implemented — this is not a certified-compliant system.
 
-# Frontend (Week 7) — separate toolchain (Node, not Python)
-cp frontend/.env.local.example frontend/.env.local
-make frontend-install
-make frontend-dev             # http://localhost:3000
-```
+## Deep Dives
 
-Sign in at `http://localhost:3000/login` with any seed account
-`scripts/seed.py` printed (`patient-a@vitalstream.dev`,
-`patient-b@vitalstream.dev`, `coach-c@vitalstream.dev`,
-`admin-o@vitalstream.dev`), password `password123` for all four.
+Longer mechanism write-ups, for anyone who wants the "why" behind a specific
+piece rather than the summary above.
 
-Datasets (WESAD, PPG-DaLiA) are *not* fetched by the steps above — they're
-only needed once a service actually replays them, so they're downloaded
-directly on whichever machine runs `docker compose up`. On a fresh cloud VM,
-[infra/cloud/bootstrap_vm.sh](infra/cloud/bootstrap_vm.sh) does the whole
-thing (install Docker, clone this repo, `data/scripts/download_datasets.sh`,
-`docker compose up -d`) in one shot. See [data/README.md](data/README.md).
-
-Each service under `services/*` is an independently installable Python package
-(`pip install -e .`) with its own `pyproject.toml` and `Dockerfile`, so it can run
-standalone or as part of `docker compose`.
-
-### Run the pipeline end-to-end (Layer 1 + Layer 2)
-
-Once `docker compose up -d` and `make bootstrap` have run, and at least one
-subject's data is under `data/raw/ppg_dalia/PPG_FieldStudy/` (see
-[data/README.md](data/README.md)), run each of these in its own terminal.
-`insight_service` needs a real `OPENAI_API_KEY` in `.env` to do anything
-useful on a cache miss — without one it'll log-and-skip every generation
-(Step 5's "调用失败时不要让整个consumer挂掉" applies to a missing key too).
-
-```bash
-services/config_service/.venv/bin/uvicorn config_service.main:app --app-dir services/config_service/src --port 8002
-services/ingestion/.venv/bin/python -m ingestion.run
-services/feature_extraction/.venv/bin/python -m feature_extraction.main
-services/insight_service/.venv/bin/python -m insight_service.consumer
-services/api/.venv/bin/uvicorn api.main:app --app-dir services/api/src --port 8000
-services/device_simulator/.venv/bin/python -m device_simulator.replay --subject S2 \
-  --device-id <the S2 device id scripts/seed.py printed>
-cd frontend && npm run dev   # http://localhost:3000 — Week 7's UI on top of all of the above
-```
-
-Since Week 6/Layer 3, `ingestion` rejects any `device_id` that isn't a row
-in `devices` (and any request missing the `X-Service-Token` header — the
-simulator reads it from `$SERVICE_TOKEN`, matching `.env`), so run
-`scripts/seed.py` first and pass one of the device ids it prints.
-
-The simulator replays real wrist-PPG samples from PPG-DaLiA subject S2 as if
-they were arriving live from a wearable (`--speed` controls playback speed;
-default 20x). Within a couple of window-lengths you should see rows land in
-Postgres:
-
-```bash
-docker exec vitalstream-postgres-1 psql -U vitalstream -d vitalstream \
-  -c "SELECT device_id, feature_type, value, window_end FROM features ORDER BY window_end DESC LIMIT 10;"
-```
-
-To sanity-check the heart-rate algorithm itself against PPG-DaLiA's own
-ground-truth labels (no live services needed):
-
-```bash
-services/feature_extraction/.venv/bin/python \
-  services/feature_extraction/scripts/validate_ppg_dalia.py --subject S2 --plot
-```
-
-### Config management & gray release
+<details>
+<summary><strong>Gray release mechanics (config_service)</strong></summary>
 
 `config_service` owns algorithm version state in Postgres (`algo_versions` +
 `algo_version_audit` — every register/canary/promote/rollback call is
 audited with an actor, action, and timestamp) and exposes it over HTTP.
-`feature_extraction` polls `GET .../active` into an in-memory cache every 30s
-(`CONFIG_REFRESH_INTERVAL_SECONDS` in `main.py`) rather than on every
-message, and routes each *device* to a version by hashing its `device_id`
-mod 100 against the canary's `rollout_pct` — so a given device stays on the
-same version for the life of a rollout instead of flip-flopping per message.
+`feature_extraction` polls `GET .../active` into an in-memory cache every
+30s (`CONFIG_REFRESH_INTERVAL_SECONDS`) rather than on every message, and
+routes each device to a version by hashing its `device_id` mod 100 against
+the canary's `rollout_pct`.
 
 ```bash
 # register the first stable version
@@ -187,172 +437,108 @@ curl localhost:8002/api/v1/config/feature-algo/heart_rate/audit-log
 `features.HEART_RATE_ALGORITHMS` maps a version string to an actual
 implementation — `v1` is the tuned algorithm, `v2-naive-wideband` is a real
 (not synthetic) bad version: the pre-tuning parameters that scored ~37 bpm
-MAE in `validate_ppg_dalia.py` before being fixed to ~8 bpm. Publishing it as
-a canary and rolling it back is a genuine "ship a regression, catch it,
-revert it" exercise, not a no-op toggle.
+MAE in `validate_ppg_dalia.py` before being fixed to ~8 bpm. Publishing it
+as a canary and rolling it back is a genuine "ship a regression, catch it,
+revert it" exercise, not a no-op toggle. Live-verified: a 20% canary landed
+in exactly 20/100 devices' feature rows, and rollback dropped that to 0/100
+within one 30s cache-refresh cycle.
 
-### Insights pipeline (Layer 2)
+</details>
 
-The PRD's second output path off of Layer 1: `feature_extraction` throttles
-each device to at most one `InsightRequest` per `insight_throttle_seconds`
-(default 60s), aggregating the last 5 windows into a snapshot
-(`heart_rate_mean`/`heart_rate_trend`) rather than firing an LLM call per
-8-second window — real products don't burn a token on every window, and
-neither should this demo. Published to `features-extracted` (Kafka), never
-by `insight_service` polling Postgres directly — same decoupling pattern as
-Layer 1's `raw-signals` → `features` hop.
+<details>
+<summary><strong>Insights pipeline mechanics (insight_service)</strong></summary>
 
-`insight_service.consumer` (distinct from `insight_service.main`'s
-user-triggered, RBAC-gated `/insights/generate` HTTP endpoint — that one
-persists to api's own `insights` table; this one is autonomous and owns its
-own `device_insights` table) does, per request: normalize the snapshot to a
-Redis cache key (rounded to 2 decimal places + prompt/model version, so
-72.001 vs 72.002 bpm don't miss the cache) → on a hit, skip the LLM entirely;
+`feature_extraction` throttles each device to at most one `InsightRequest`
+per `insight_throttle_seconds` (default 60s), aggregating the last 5
+windows into a snapshot (`heart_rate_mean`/`heart_rate_trend`) rather than
+firing an LLM call per 8-second window. Published to `features-extracted`
+(Kafka), never polled from Postgres directly.
+
+`insight_service.consumer` (distinct from `.main`'s user-triggered,
+RBAC-gated `/insights/generate` HTTP endpoint — that one persists to `api`'s
+own `insights` table; this one is autonomous and owns `device_insights`)
+does, per request: normalize the snapshot to a Redis cache key (rounded to
+2 decimal places + prompt/model version) → on a hit, skip the LLM entirely;
 on a miss, call OpenAI (one retry, 15s timeout, failures logged and skipped
 rather than crashing the consumer), computing real cost from
 `usage.prompt_tokens`/`completion_tokens` against a static price table
 (`insight_service/pricing.py`) → persist the `DeviceInsight` either way,
-`cache_hit`/`latency_ms`/`cost_usd` included (a hit costs $0 and takes
-~1ms; a miss costs whatever the model call actually billed), so cache hit
-rate and the latency/cost delta it buys are a query away, not a claim —
-`insight_service.eval.cache_savings` runs that query and prints the
-"缓存命中率 X%，节省了约 $Y / 降低了 Z ms" summary directly.
+`cache_hit`/`latency_ms`/`cost_usd` included.
 
 ```bash
 services/insight_service/.venv/bin/python -m insight_service.eval.cache_savings --limit 200
-```
-
-**Hit rate depends heavily on traffic shape, not just time elapsed** — see
-[benchmarks/week5_eval_report.md](benchmarks/week5_eval_report.md) §2 for
-the measured numbers: one continuously-varying device's own snapshots rarely
-repeat exactly (0.2% hit rate over a full real replay), but multiple devices
-in similar physiological states organically collide on the same rounded
-snapshot constantly (56.9% across a synthetic fleet resting near the same
-heart rate) — this cache pays off at fleet scale, not from one device
-running longer.
-
-### Evaluation & A/B testing
-
-`benchmarks/cases.yaml` is 22 hand-written cases (4 categories: normal,
-elevated heart rate, HRV drop, boundary/edge cases) — each with human-written
-`checks` describing what a grounded, safe response should do, not full
-expected-output text (exact-matching LLM output isn't realistic).
-`insight_service.eval.judge` scores exactly two dimensions on purpose
-(more would make the eval framework more complex than the thing it's
-evaluating): `check_grounded` is a rule-based check (does the described
-trend direction match the data, does the text cite an actual number) —
-no LLM needed for that half. `check_hallucination` calls an LLM judge
-(same or a different model, configurable) with a strict yes/no + reason
-prompt, JSON-parsed; a judge failure scores as unscored (`None`), never a
-silent "no hallucination found".
-
-```bash
 services/insight_service/.venv/bin/python -m insight_service.eval.run_benchmark --prompt-version v1 --model gpt-4o-mini
 services/insight_service/.venv/bin/python -m insight_service.eval.run_benchmark --prompt-version v2 --model gpt-4o-mini
 ```
 
-Each run calls the real LLM directly (bypassing Redis on purpose — eval
-measures generation quality, not cache hits) and writes one row per case to
-`benchmarks/results/{timestamp}_{prompt_version}_{model}.csv`, plus a
-grounded_rate/hallucination_rate/avg_latency/avg_cost summary to stdout.
-`v1` vs `v2` is a real, measured comparison, not a hypothetical one:
-**grounded_rate 18.2% → 95.5%**, at the cost of ~32% more latency and ~40%
-more cost per call. See
-[benchmarks/week5_eval_report.md](benchmarks/week5_eval_report.md) for the
-full comparison table, the chart, and — more interesting than the headline
-number — why v2 actually helps (not the failure mode the project originally
-guessed it would fix) and a real bug the eval process itself caught along
-the way.
+`benchmarks/cases.yaml` (22 hand-written cases, 4 categories) each carry
+human-written `checks` describing what a grounded, safe response should
+do — not full expected-output text, since exact-matching LLM output isn't
+realistic. `insight_service.eval.judge` scores two dimensions:
+`check_grounded` is rule-based (does the described trend direction match
+the data, does the text cite an actual number) — no LLM needed for that
+half; `check_hallucination` calls an LLM judge with a strict yes/no + reason
+prompt; a judge failure scores as unscored (`None`), never a silent "no
+hallucination found."
 
-### 认证与权限 (Layer 3, Week 6)
+</details>
 
-**角色定义**：`patient`（只能访问自己的数据）、`coach`（只能访问被显式授权的
-patient）、`admin`（平台运维，PRD 里的 "operator" 概念——代码里统一叫
-`admin`，没有为同一角色引入两个名字）。
+<details>
+<summary><strong>RBAC & audit log design (api)</strong></summary>
 
-**两层 RBAC**：
+**Roles**: `patient` (own data only), `coach` (only patients explicitly
+granted via `coach_patient`), `admin` (platform operator — the PRD's
+"operator" concept, one name in code).
 
-1. **角色级**（`api/rbac.py: require_role`）：端点级别的粗粒度门禁，比如
-   `POST /config/feature-algo` 只允许 `admin`。
-2. **资源级**（`api/deps.py: authorize_user_access` / `authorize_device_access`）：
-   同一个角色内，谁能访问哪条具体数据。`patient` 只能是自己；`coach` 必须在
-   `coach_patient` 表里有一行显式授权记录，否则一律拒绝——没有这张表，"coach
-   能看患者数据" 就退化成 "coach 能看所有人数据"。两个依赖都以数据库里的归属
-   关系为准（例如 `authorize_device_access` 先查 `devices.user_id`），不信任
-   JWT payload 或路径参数里的任何 id。
+**Two RBAC layers**:
+1. **Role-level** (`api/rbac.py: require_role`) — coarse endpoint gating,
+   e.g. `POST /config/feature-algo` requires `admin`.
+2. **Resource-level** (`api/deps.py: authorize_user_access` /
+   `authorize_device_access`) — within a role, *which* rows. Backed by the
+   database's actual ownership (`devices.user_id`, `coach_patient` grants),
+   never trusting a JWT payload or path parameter's claimed id.
 
-**越权返回码的取舍**：本项目里越权统一返回 `403`，而不是把 "不存在" 和 "无权
-访问" 都伪装成 `404`。原因是这套 RBAC 面向的是 patient/coach/admin 三种已知
-身份之间的内部协作场景（不是防止外部人枚举陌生 `user_id`），`403` 能让前端
-（Week 7）清楚区分 "这条路径你走错了" 和 "这个人根本不存在"，调试体验更好；
-真正未知的 id（比如 device 不存在）仍然返回 `404`。这与很多公开 SaaS API 的
-惯例相反，是刻意的选择，面试如果问起就是这个理由。
+**Audit log** (`api/audit.py`) only records what PRD §5.3 actually asks
+for — cross-user health data reads (`insights.read`/`features.read`, only
+when `actor.id != target_user_id`), config mutations
+(`config.publish_canary`/`config.rollback`), auth events
+(`auth.login_success`/`auth.login_failed`), and every resource-level
+authorization denial (`status='denied'`). Self-reads are never logged — a
+blanket request log would bury the "who looked at whose data" signal in
+noise. Written synchronously in the same transaction as the action, not
+queued: these endpoints are low-frequency, and a dropped audit row is a
+compliance problem.
 
-**安全基线**（Step 8 清单，逐条已过一遍）：
+`GET /audit-logs` is itself access-controlled: a `coach` sees only records
+they triggered or that target their granted patients; only `admin` sees
+everything — an unguarded audit endpoint is one of the most common and
+most ironic RBAC holes.
 
-- [x] `JWT_SECRET_KEY`/`SERVICE_TOKEN` 来自环境变量，`.env` 在 `.gitignore`
-      里，仓库里没有真实密钥。
-- [x] 解码 token 时用 `algorithms=[settings.jwt_algorithm]` 显式指定白名单
-      （`api/auth.py`），拒绝 `alg: none` 类型的伪造 token；`exp` 由 PyJWT
-      自动校验。
-- [x] access token 30 分钟过期；refresh token 7 天，`jti` 落库
-      `refresh_tokens`，`logout` 真正撤销它——纯无状态 JWT 做不到这一点。
-- [x] 密码用 bcrypt 哈希；`login` 对 "用户不存在" 和 "密码错误" 返回完全相同
-      的错误信息（防枚举）。
-- [x] 所有非公开端点都有认证依赖——`tests/test_route_auth.py` 遍历
-      `app.routes` 断言这件事，而不是靠人工检查。
-- [x] CORS 只允许 `http://localhost:3000`（Week 7 前端），不是 `["*"]`。
-- [x] `login` 有基础限流（`api/rate_limit.py`：单进程固定窗口计数器，够用但
-      不是分布式方案——这个项目单进程部署，上 Redis 是过度设计）。
-- [x] 响应用独立的 `UserOut`/`DeviceOut` 等 pydantic 模型，从不直接把 ORM
-      对象序列化出去，`hashed_password` 永远不会出现在响应里。
-- [x] 数据库查询全部参数化：ORM 查询天然如此；`routers/features.py` 里唯一
-      的裸 SQL 用 SQLAlchemy `text()` + 具名绑定参数，没有 f-string 拼 SQL。
+**Alembic boundary**: `services/api/migrations` manages only `api`'s own
+tables (`users`/`devices`/`coach_patient`/`insights`/`refresh_tokens`/
+`audit_logs`). `features` (feature_extraction-owned) and `device_insights`
+(insight_service-owned) share the same physical Postgres instance but keep
+their own service-managed schema — `api` reads them with read-only raw SQL,
+never with an Alembic-managed foreign key. This cross-service-shared-DB,
+separately-owned-schema boundary was set in Week 1 and deliberately held
+here rather than blurred for convenience.
 
-**审计日志只记录敏感操作**（`api/audit.py`）：跨用户健康数据读取
-（`insights.read`/`features.read`，仅当 `actor.id != target_user_id`）、配置
-变更（`config.publish_canary`/`config.rollback`）、认证事件
-（`auth.login_success`/`auth.login_failed`）、以及 `api/deps.py` 里所有资源
-级授权失败（`status='denied'`）。自己读自己的数据不写审计——全量记录会把
-"谁看了谁的数据" 这个真正有价值的问题淹没在噪音里。写入与业务操作同事务、
-同步提交，不走 Kafka：这些端点低频，丢一条审计记录是合规问题，可以接受的
-性能代价换来的是"审计不会丢"的保证。`GET /audit-logs` 本身也有权限收敛：
-`coach` 只能看到自己触发的、或指向自己被授权 patient 的记录；只有 `admin`
-能看全量——审计接口自己权限没做对，是最讽刺也最常见的一类漏洞。
-
-**Alembic 与跨服务表的边界**：`services/api/migrations` 只管理 `api` 自己
-的表（`users`/`devices`/`coach_patient`/`insights`/`refresh_tokens`/
-`audit_logs`）。`features`（feature_extraction 拥有）和 `device_insights`
-（insight_service 拥有）虽然物理上在同一个 Postgres 实例里，但 schema 由各
-自服务的 `Base.metadata.create_all` 管理——`api` 只用只读裸 SQL 查询它们
-（`routers/features.py`），不去用 Alembic 给别的服务的表加外键。跨服务共享
-物理数据库、各自管理各自 schema 是这个项目从 Week 1 就定下的边界，这周没有
-改变它；`insights.device_id -> devices` 这类外键因此也没有加，取舍在这里
-写清楚而不是假装做了。同理，`config_service` 自己的 `algo_version_audit`
-表也保留不动，没有并入 `api` 的 `audit_logs`：它是 `config_service` 自己
-`GET .../audit-log` 端点的数据源，服务边界内自洽；`api` 的 `audit_logs`
-额外记录的是 `config.publish_canary`/`config.rollback` 这两个操作*谁通过
-api 触发的*（`actor_id`/`ip_address` 这些 api 才知道的身份信息），两张表
-回答的是不同的问题（"这个 algo 的版本历史" vs "谁在什么时候做了什么"），
-合并会丢失后者身份维度或引入跨服务写耦合，所以保留两张表是有意的选择。
-
-### API 使用
+**Reproducing the RBAC + audit claims by hand:**
 
 ```bash
-# 1. 登录拿 token（scripts/seed.py 建的账号，密码统一是 password123）
+# 1. log in (any scripts/seed.py account, password123 for all)
 curl -s -X POST localhost:8000/api/v1/auth/login \
   -d "username=patient-a@vitalstream.dev&password=password123" | tee /tmp/login.json
 ACCESS=$(python3 -c "import json;print(json.load(open('/tmp/login.json'))['access_token'])")
 
-# 2. 查自己的健康洞察（Week 4-5 链路真实生成的数据，不是 mock）
-curl -s localhost:8000/api/v1/users/<patient-a-id>/insights \
-  -H "Authorization: Bearer $ACCESS"
+# 2. read your own insights (real data, not mock)
+curl -s localhost:8000/api/v1/users/<patient-a-id>/insights -H "Authorization: Bearer $ACCESS"
 
-# 3. 越权被拒：用 patient A 的 token 查 patient B 的数据 -> 403
+# 3. try another patient's data -> 403
 curl -s -o /dev/null -w "%{http_code}\n" localhost:8000/api/v1/users/<patient-b-id>/insights \
   -H "Authorization: Bearer $ACCESS"
 
-# 4. 审计留痕：用 coach C（已被授权访问 A）登录后查审计日志
+# 4. as the authorized coach, read patient A, then check the audit trail
 curl -s -X POST localhost:8000/api/v1/auth/login \
   -d "username=coach-c@vitalstream.dev&password=password123" | tee /tmp/coach.json
 COACH_ACCESS=$(python3 -c "import json;print(json.load(open('/tmp/coach.json'))['access_token'])")
@@ -360,263 +546,54 @@ curl -s localhost:8000/api/v1/users/<patient-a-id>/insights -H "Authorization: B
 curl -s localhost:8000/api/v1/audit-logs -H "Authorization: Bearer $COACH_ACCESS"
 ```
 
-This is also the Week 8 demo recording's script for the "企业级交付" segment.
+</details>
 
-### 前端架构 (Layer 3, Week 7)
+<details>
+<summary><strong>Frontend BFF architecture (frontend)</strong></summary>
 
-`frontend/` is a Next.js 14 App Router app — Tailwind for styling (hand-rolled
-primitives in `components/ui/`, not shadcn/ui: its CLI pulls component
-source from a registry over the network at generation time, which doesn't
-fit a non-interactive build environment; the components it would have
-generated are simple enough to write directly), TanStack Query for all
-server-state fetching/caching/polling, Recharts for the trend chart.
-
-**Auth is BFF-mode, not "call the API from the browser"**:
+`frontend/` is a Next.js 14 App Router app — Tailwind (hand-rolled UI
+primitives in `components/ui/` rather than shadcn/ui, whose CLI pulls
+component source from a network registry at generation time), TanStack
+Query for all server-state fetching/caching/polling, Recharts for the trend
+chart.
 
 ```
-browser  ──(same-origin, cookie rides along)──▶  Next.js Route Handlers  ──(Authorization: Bearer)──▶  api (:8000)
+browser  ──(same-origin, cookie rides along)──▶  Next.js Route Handlers  ──(Authorization: Bearer)──▶  api
            /api/auth/{login,logout,me}
            /api/proxy/[...path]  (everything else)
 ```
 
-- `POST /api/auth/login` forwards to FastAPI, then writes the returned
-  access/refresh tokens into **httpOnly** cookies (`lib/server/cookies.ts`)
-  and returns only `{id, email, role, display_name}` to the browser — the
-  tokens themselves never reach client JS.
+- `POST /api/auth/login` forwards to FastAPI, writes the returned
+  access/refresh tokens into **httpOnly** cookies, and returns only
+  `{id, email, role, display_name}` to the browser.
 - `GET/POST /api/proxy/[...path]` is the one door every client component
-  knocks on (`lib/apiFetch.ts`) for actual data. It reads the access-token
-  cookie, adds `Authorization`, and forwards to `api`. A `401` triggers one
-  single-flight refresh (`lib/server/refresh.ts` — a module-scope in-flight
-  promise, so five widgets 401-ing at once produces one refresh call, not
-  five racing ones) and a retry; a `403` passes straight through untouched
-  — conflating "your token is stale" with "you don't have access" would
+  knocks on for data. It reads the access-token cookie, adds
+  `Authorization`, forwards to `api`. A `401` triggers one single-flight
+  refresh (a module-scope in-flight promise, so five widgets 401-ing at
+  once produce one refresh call, not five racing ones) and a retry; a `403`
+  passes straight through — conflating "stale token" with "no access" would
   retry-loop a permission denial forever.
-- **Why not `localStorage`**: an XSS payload can read `localStorage` but
-  can't read an httpOnly cookie — that's the whole point. The trade-offs
-  that come with it: an extra network hop (browser → Next → FastAPI instead
-  of straight to FastAPI), Next.js's server becomes a required component
-  (no static-only deploy), and CSRF has to be handled by `SameSite=Lax` +
-  only using `POST` for writes (a `GET` can't be CSRF'd into mutating
-  state). Week 6's CORS allowlist (`localhost:3000`) exists for Swagger/curl
-  debugging only — the app itself never makes a cross-origin request.
-- `middleware.ts` redirects a visitor with no refresh cookie away from
-  `/dashboard`, `/patients`, `/admin` before the page even renders, and
-  `components/RoleGate.tsx` shows a clean "Access denied" instead of a
-  403'd page full of broken widgets when a role doesn't match a route.
-  **Neither of these is a security boundary** — they only improve what an
-  already-logged-out or wrong-role visitor sees. The actual authorization
-  decision is made exactly once, in FastAPI, by Week 6's RBAC dependencies;
-  a request that bypassed the frontend entirely (raw curl) gets exactly the
-  same answer.
+- `middleware.ts` redirects a logged-out visitor away from protected routes
+  before the page renders, and `components/RoleGate.tsx` shows a clean
+  "Access denied" instead of a page full of 403'd widgets when a role
+  doesn't match a route. **Neither is a security boundary** — the real
+  authorization decision is made exactly once, in FastAPI; a request that
+  bypassed the frontend entirely (raw curl) gets the same answer.
+- `POST /insights/generate` is awaited directly rather than polled — see
+  [Key Design Decisions](#key-design-decisions) — with a 60s client-side
+  abort so a stuck LLM call can't hang the button forever.
 
-**Types**: `lib/api-types.ts` is meant to be generated —
-`npm run gen:api` runs `openapi-typescript` against a live api service's
-`/openapi.json`. It ships hand-written for now (this environment couldn't
-run the full Postgres+api stack to generate against), matching the actual
-Pydantic response models in `services/api/src/api/routers/*.py` as of this
-week; regenerate it once you have the stack up, per the comment at the top
-of that file.
+</details>
 
-**On-demand insight generation isn't a 202-then-poll flow.** Week 6's
-`POST /insights/generate` is synchronous (it reuses insight_service's Redis
-cache directly, same machinery the autonomous pipeline uses — see that
-router's comment) rather than publishing to Kafka and returning `202`. So
-`lib/hooks/useGenerateInsight.ts` just awaits the call, with a 60s client-side
-abort so a stuck LLM call can't spin the button forever — functionally the
-same guarantee ("don't wait/poll forever") as a bounded poll loop, adapted
-to how this endpoint actually works. The dashboard's insight feed itself
-*is* a merge of two sources (`api`'s on-demand `insights` table + Week 4's
-autonomous `device_insights` table, joined server-side in
-`GET /users/{id}/insights` — see that endpoint's comment), so a manually
-generated insight and the continuous background pipeline's output land in
-the same list either way.
+## Dataset & License
 
-### 界面截图
+Wearable signals are replayed from **PPG-DaLiA** (Reiss et al.), hosted on
+the [UCI Machine Learning Repository](https://archive.ics.uci.edu/) — a
+public research dataset, not proprietary or personal data. See its UCI page
+for citation details and usage terms; the dataset itself is not committed
+to this repo (`data/raw/` is gitignored) — `data/scripts/download_datasets.sh`
+fetches it directly.
 
-All captured against the real stack (`docker compose up -d` + `scripts/seed.py`
-+ a live simulator run + a real OpenAI key) — every number and sentence
-below is a genuine record, not a mock.
-
-![Login](docs/screenshots/login.png)
-
-![Patient dashboard](docs/screenshots/patient-dashboard.png)
-
-Patient A's own view — the insight card's `GENERATED`/`PROMPT`/`CACHE`/`COST`
-row and the heart-rate trend chart are both reading real rows the Week 1-5
-pipeline produced (simulator → ingestion → feature_extraction →
-`features-extracted` → `insight_service.consumer` → `device_insights`),
-merged with any on-demand `生成洞察` clicks in the same list (see "前端架构").
-
-![Coach patient detail](docs/screenshots/coach-patient-detail.png)
-
-Coach C viewing authorized patient A — the *exact same* dashboard component
-as the screenshot above, just with `userId` swapped to the path param
-(`components/PatientDashboard.tsx`'s whole reason for existing).
-
-![Access denied](docs/screenshots/access-denied.png)
-
-Coach C hand-editing the URL to patient B's id — cleanly denied by
-`api`'s resource-level RBAC (Week 6), surfaced as a clean page instead of a
-stack of broken 403'd widgets (`app/(app)/patients/[id]/page.tsx`).
-
-![Audit log, denied filter](docs/screenshots/audit-log-denied.png)
-
-The access attempt above, found by admin-o filtering `/admin/audit` to
-"仅看被拒绝" — actor, action, target, and source IP all legible, `denied`
-in red. This and the previous screenshot together are the Week 7 acceptance
-demo's second claim end to end.
-
-![Admin config](docs/screenshots/admin-config.png)
-
-`heart_rate`'s real version history from earlier gray-release testing
-(`v1` active, `v2-naive-wideband` retired via rollback) — same data Week 3's
-`config_service` produced, now driven from the UI instead of curl.
-
-### Observability (tracing)
-
-`docker compose up -d` includes Jaeger (`jaegertracing/all-in-one`) — UI at
-[localhost:16686](http://localhost:16686). `ingestion` and
-`feature_extraction` both call `vitalstream_common.telemetry.configure_tracing()`
-and export spans via OTLP/HTTP to Jaeger. The interesting part isn't the
-per-service spans (FastAPI is auto-instrumented) — it's that they're all
-*one trace* across two processes: `ingestion.kafka_producer` injects the
-current span's W3C trace context into the outgoing Kafka message's headers,
-and `feature_extraction.main`'s consumer loop extracts it back out and
-continues the same trace instead of starting a new one. Search for any
-recent trace under service `ingestion` and you'll see:
-
-```
-POST /api/v1/devices/{id}/signals   (ingestion, HTTP)
-└─ consume raw-signal               (feature_extraction, Kafka)
-   ├─ compute feature (bandpass+peaks)
-   ├─ produce features-topic
-   └─ write features row (postgres)
-```
-
-one span per stage from device upload to DB write, with real per-stage
-latency (typically: Postgres write and Kafka produce dominate; the actual
-signal-processing math is comparatively cheap).
-
-## Status
-
-Layers 1-2 (PRD milestones: Week 1-2 through Week 5) are working end-to-end:
-
-- **Week 1-2**: the device simulator replays real PPG-DaLiA wrist-BVP data
-  over HTTP, ingestion batches it onto Redpanda, and feature_extraction
-  derives heart rate via a bandpass-filter + peak-detection pipeline (tuned
-  against ground truth — see `validate_ppg_dalia.py`; naive parameters
-  produced a ~37 bpm MAE from picking up the PPG dicrotic notch as a second
-  peak per beat, tightened to ~8 bpm), persisting `Feature` rows to Postgres.
-- **Week 3**: `config_service` gray-releases feature-algo versions (Postgres-
-  backed, audited, hash-bucketed per device — live-verified: a 20% canary
-  landed in exactly 20/100 devices' feature rows, and rollback dropped that
-  to 0/100 within one 30s cache-refresh cycle); a full ingestion→Kafka→
-  feature_extraction→Postgres trace is visible in Jaeger; and benchmarking
-  ingestion found a real bug (the producer was blocking each HTTP response on
-  a full Kafka ack, not just returning 202 immediately) — fixing it measured
-  ~4.8x throughput / ~6.5x P50 latency at fixed concurrency. See
-  [benchmarks/results.md](benchmarks/results.md) for the full methodology,
-  including a couple of benchmarking dead ends worth knowing about before
-  trusting any throughput number on this stack.
-- **Week 4**: `feature_extraction` throttles per-device output onto
-  `features-extracted` (Kafka-decoupled, not Postgres-polled); `insight_service
-  .consumer` turns aggregated snapshots into cached, LLM-generated advice.
-  Live-verified end-to-end against real PPG-DaLiA replay and a real OpenAI
-  key: generated insights correctly referenced the actual heart-rate numbers
-  and trend direction (not templated filler), a real rate-limit/quota error
-  was hit mid-run and the consumer logged-and-skipped it without crashing
-  (features kept flowing throughout), and the fixed-precision cache key
-  produced a genuine, unforced 13/26 (50%) cache hit rate during a short
-  partial replay — Week 5's fuller run tells a more complete story (below).
-- **Week 5**: real eval, not a placeholder — `benchmarks/cases.yaml` (22
-  hand-written cases) scored on two dimensions (rule-based groundedness,
-  LLM-judge hallucination detection). A real, measured prompt A/B:
-  **grounded_rate 18.2% → 95.5%** (v1 → v2), for a real cost — ~32% more
-  latency, ~40% more cost per call. The fix targeted a *different* problem
-  than the one this project started out expecting (v1 essentially never
-  hallucinated; it just too often skipped citing the actual number it was
-  given), which only showed up because the benchmark was run for real
-  instead of assumed. Real per-call cost from OpenAI's actual token usage
-  (not estimated) is now in every `device_insights`/`Insight` row.
-  Draining a full 514-row single-device replay to completion (not a partial
-  snapshot mid-backlog) put the real organic cache hit rate at 0.2% — very
-  different from Week 4's 50%, because a fleet of similar devices, not one
-  continuously-varying device, is what actually drives this cache's hit
-  rate (confirmed: 56.9% across 40 synthetic devices resting near the same
-  heart rate). See [benchmarks/week5_eval_report.md](benchmarks/week5_eval_report.md).
-
-- **Week 6**: `api` grew from a scaffold into a real control-plane service —
-  OAuth2/JWT auth with revocable refresh tokens, two-layer RBAC (role +
-  resource, the latter backed by a real `coach_patient` grants table rather
-  than "coach sees everyone"), and an audit log scoped to what PRD 5.3
-  actually asks for (cross-user reads, config mutations, auth events, denials)
-  instead of a blanket request log. Alembic now owns api's own schema
-  (`services/api/migrations`); Week 3's config `/admin/*` routes stayed
-  proxied through `api`'s RBAC+audit layer (already done then, verified this
-  week); `ingestion`'s signal endpoint gained service-token auth and rejects
-  unregistered devices. See "认证与权限"/"API 使用" above for the design
-  tradeoffs and a runnable demo script; `tests/test_rbac.py` /
-  `tests/test_route_auth.py` / `tests/test_audit.py` are the permission-matrix
-  and audit-trail tests backing the three acceptance-demo claims.
-
-- **Week 7**: `frontend` — a Next.js App Router dashboard, BFF-authenticated
-  (httpOnly cookies, never `localStorage`; see "前端架构" above for the
-  full rationale) against Week 6's `api`. Patient/coach share one dashboard
-  component (`components/PatientDashboard.tsx`) parameterized by `userId`,
-  so "coach views an authorized patient" is a reuse, not a second
-  implementation. Two backend gaps surfaced while wiring the frontend up
-  and were fixed this week rather than worked around: `GET
-  /coach/patients` didn't exist (coach_patient was write-only), and
-  `GET /users/{id}/insights`/`GET /features/{device_id}`'s `before`/
-  `start_ts`/`end_ts` cursor params were bound as raw strings against
-  timestamp columns — duck-typed into working on sqlite's test DB, but a
-  real bug against asyncpg/Postgres that unit tests hadn't caught (fixed via
-  explicit `datetime.fromisoformat` parsing + typed SQLAlchemy bind params,
-  see `tests/test_pagination.py`). `POST /insights/generate` also changed
-  from "caller supplies a hand-built features dict" to "caller supplies a
-  device_id, api pulls the latest per-feature-type value itself" — the
-  original shape had no answer for "what does a browser button actually
-  send." Three Playwright specs (`frontend/e2e/`) encode this week's three
-  acceptance-demo claims.
-
-  **Live-verified end to end**, not just built: against the real dockerized
-  stack (`docker compose up -d`, `alembic upgrade head`, `scripts/seed.py`,
-  a real simulator replay, a real OpenAI key), all three acceptance-demo
-  claims were reproduced in an actual browser — see "界面截图" for the
-  screenshots. Getting there past the build surfaced four more real bugs,
-  none of which sqlite-backed unit tests could have caught (all fixed, see
-  the commit history and the relevant files' comments for each):
-  `alembic.ini`'s `script_location`/`prepend_sys_path` were plain relative
-  paths, so `alembic -c services/api/alembic.ini upgrade head` silently
-  resolved `migrations` against the caller's cwd instead of the ini file's
-  own directory (fixed with Alembic's `%(here)s` token); `UserORM.role`/
-  `DeviceORM.status` are Python `StrEnum`s, and SQLAlchemy's `Enum` type
-  defaults to storing the member *name* ("PATIENT") rather than `.value`
-  ("patient") — invisible on sqlite (no real enum type to reject the
-  mismatch) but a hard `InvalidTextRepresentationError` against Postgres's
-  actual `CREATE TYPE ... AS ENUM('patient', ...)` (fixed with
-  `values_callable`); two raw-SQL queries had a `:param IS NULL OR ...`
-  clause whose parameter asyncpg couldn't type-infer when actually NULL —
-  "could not determine data type of parameter" (fixed with explicit
-  SQLAlchemy `bindparam(..., type_=...)` on every such param); and
-  `features.py`'s `SELECT ... window ...` was a syntax error against real
-  Postgres because `window` is a reserved word there (fixed by quoting it).
-  Separately, wiring `frontend`/`api`/`ingestion`/etc. into
-  `docker-compose.yml` needed each service's inter-container URLs
-  (`POSTGRES_DSN`, `KAFKA_BOOTSTRAP_SERVERS`, `*_SERVICE_BASE_URL`)
-  overridden from `.env`'s host-dev `localhost:<port>` values to the
-  compose network's service names, ingestion's raw-asyncpg `POSTGRES_DSN`
-  needed the SQLAlchemy `+asyncpg` driver suffix stripped (it uses asyncpg
-  directly, not through SQLAlchemy, and asyncpg's own DSN parser rejects
-  that suffix), and `insight_service`'s Dockerfile only ever started its
-  on-demand HTTP API — the autonomous Kafka consumer that actually
-  populates `device_insights` needed its own compose service on the same
-  image with a `command:` override. None of this is exotic; it's the
-  standard gap between "the code is correct" and "the code has touched a
-  real Postgres/compose network," and it's exactly the kind of gap `git log`
-  and this section exist to be honest about.
-
-Layer 3's control plane (Week 6) and dashboard (Week 7) are both now real
-and live-verified, not scaffolds. See [docs/PRD.md](docs/PRD.md) section 7
-for the full milestone plan (Week 8: load testing, monitoring dashboards,
-CI/CD, demo recording).
+This repository has no LICENSE file yet — it's a personal portfolio/job-
+search project (see [docs/PRD.md §1.4](docs/PRD.md)), not currently
+distributed under an open-source license.

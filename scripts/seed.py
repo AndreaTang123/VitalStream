@@ -5,7 +5,7 @@ subjects Week 1-5 already replay (S2, S3) to A and B as devices with
 deterministic UUIDs (so `--device-id` on the simulator lines up with a real
 `devices` row instead of a random one ingestion would reject), and grants
 coach C access to patient A only — B stays unauthorized for C, which is what
-the RBAC demo (README "API 使用") exercises.
+the RBAC demo (README "Deep Dives → RBAC & audit log design") exercises.
 
 Run with the api service's venv so `api`/`vitalstream_common` are importable:
 

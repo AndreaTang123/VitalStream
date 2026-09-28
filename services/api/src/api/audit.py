@@ -3,8 +3,9 @@ it was allowed.
 
 Only called for the things PRD 5.3 actually cares about — cross-user health
 data reads, config mutations, auth events, and authorization denials — never
-from a blanket middleware (see README "认证与权限" for why: a full request
-log buries the "who looked at whose data" answer in health-check noise).
+from a blanket middleware (see README "Deep Dives → RBAC & audit log design"
+for why: a full request log buries the "who looked at whose data" answer in
+health-check noise).
 
 Written synchronously in the same request/transaction as the action it
 records, not queued — these endpoints are low-frequency, and a dropped audit

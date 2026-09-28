@@ -78,8 +78,8 @@ async def generate_insight(
     # autonomous per-device pipeline (feature_extraction's throttled
     # publish -> insight_service.consumer -> device_insights) is the
     # Kafka-decoupled path; this button intentionally isn't it — see
-    # README "前端架构" for why the frontend awaits this call directly
-    # instead of polling a 202.
+    # README "Deep Dives → Frontend BFF architecture" for why the frontend
+    # awaits this call directly instead of polling a 202.
     async with httpx.AsyncClient(base_url=settings.insight_service_base_url, timeout=30.0) as client:
         response = await client.post(
             "/api/v1/insights/generate",

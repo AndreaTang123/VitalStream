@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     cors_allow_origins: list[str] = ["http://localhost:3000"]
     # Fixed-window login rate limit (PRD 5.3's "basic throttling", not a full
     # Redis-backed limiter — single-process is an accepted tradeoff at this
-    # project's scale; see README "认证与权限").
+    # project's scale; see README "Security").
     login_rate_limit_attempts: int = 5
     login_rate_limit_window_seconds: int = 60
 
