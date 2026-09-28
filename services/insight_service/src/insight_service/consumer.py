@@ -15,12 +15,19 @@ import logging
 import time
 
 from aiokafka import AIOKafkaConsumer
+from prometheus_client import start_http_server
 from sqlalchemy.ext.asyncio import create_async_engine
 from vitalstream_common.schemas import DeviceInsight, InsightRequest
 
 from insight_service.cache import get_cached, make_cache_key, set_cached
 from insight_service.db import DeviceInsightStore
 from insight_service.llm_client import llm_client
+from insight_service.metrics import (
+    INSIGHT_CACHE_HITS_TOTAL,
+    INSIGHT_CACHE_MISSES_TOTAL,
+    LLM_COST_USD_TOTAL,
+    LLM_REQUEST_SECONDS,
+)
 from insight_service.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -40,6 +47,7 @@ class InsightConsumerWorker:
         )
         await self._consumer.start()
         await self._store.start()
+        start_http_server(settings.metrics_port)
 
     async def stop(self) -> None:
         if self._consumer is not None:
@@ -64,6 +72,7 @@ class InsightConsumerWorker:
         cached = await get_cached(key)
 
         if cached is not None:
+            INSIGHT_CACHE_HITS_TOTAL.inc()
             insight = DeviceInsight(
                 device_id=request.device_id,
                 insight_text=cached.insight_text,
@@ -83,13 +92,18 @@ class InsightConsumerWorker:
             )
             logger.info("cache hit for %s (%.1fms)", request.device_id, insight.latency_ms)
         else:
+            INSIGHT_CACHE_MISSES_TOTAL.inc()
             try:
-                response = await llm_client.generate_device_insight(
-                    request.feature_snapshot, prompt_version=prompt_version, model_version=model
-                )
+                with LLM_REQUEST_SECONDS.time():
+                    response = await llm_client.generate_device_insight(
+                        request.feature_snapshot, prompt_version=prompt_version, model_version=model
+                    )
             except Exception as exc:  # noqa: BLE001 - any LLM failure: log and skip, don't crash the consumer
                 logger.error("LLM generation failed for %s, skipping: %s", request.device_id, exc)
                 return None
+            LLM_COST_USD_TOTAL.labels(model=response.model_version, prompt_version=response.prompt_version).inc(
+                response.cost_usd
+            )
 
             insight = DeviceInsight(
                 device_id=request.device_id,

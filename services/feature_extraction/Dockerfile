@@ -8,4 +8,5 @@ COPY services/feature_extraction /app
 
 RUN pip install --no-cache-dir -e /libs/common -e .
 
+EXPOSE 9101
 CMD ["python", "-m", "feature_extraction.main"]

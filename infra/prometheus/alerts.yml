@@ -1,0 +1,42 @@
+# week8 Step 2: three rules, deliberately not wired to Alertmanager/email/
+# Slack — "firing" visible in Prometheus's own Alerts UI is the completion
+# bar this week set (see README "Observability"). The SLO numbers here
+# (200ms P99, 1% error rate) are the same ones benchmarks/RESULTS.md's load
+# test thresholds use — defined once, before the load test ran, not picked
+# afterward to make a chart look good.
+groups:
+  - name: vitalstream
+    rules:
+      - alert: ConsumerLagGrowing
+        # A positive, sustained derivative means features_extraction is
+        # falling behind raw-signals, not just momentarily catching up
+        # after a burst — the single most important "is the pipeline
+        # actually keeping up" signal, since ingestion's own HTTP latency
+        # stays fast right up until the consumer falls over.
+        expr: deriv(consumer_lag_messages[5m]) > 1
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "feature_extraction consumer lag has been growing for 2+ minutes"
+
+      - alert: IngestionHighErrorRate
+        expr: |
+          (
+            sum(rate(http_request_duration_seconds_count{job="ingestion", status=~"5.."}[1m]))
+            /
+            sum(rate(http_request_duration_seconds_count{job="ingestion"}[1m]))
+          ) > 0.01
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "ingestion 5xx rate above 1% for 1+ minute"
+
+      - alert: IngestionP99LatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(http_request_duration_seconds_bucket{job="ingestion", handler="/api/v1/devices/{device_id}/signals"}[1m]))
+          ) > 0.2
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "ingestion P99 above the 200ms SLO for 2+ minutes"

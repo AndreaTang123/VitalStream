@@ -6,11 +6,13 @@ from fastapi import Depends, HTTPException, status
 from vitalstream_common.schemas import Role
 
 from api.auth import CurrentUser, get_current_user
+from api.metrics import AUTHZ_DENIED_TOTAL
 
 
 def require_role(*allowed_roles: Role):
     async def _check(current_user: CurrentUser = Depends(get_current_user)) -> CurrentUser:
         if current_user.role not in allowed_roles:
+            AUTHZ_DENIED_TOTAL.labels(action="role_check").inc()
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"role '{current_user.role}' is not permitted to access this resource",

@@ -23,6 +23,7 @@ from api.audit import write_audit_log
 from api.auth import CurrentUser, get_current_user
 from api.db.base import get_db
 from api.db.models import CoachPatientORM, DeviceORM
+from api.metrics import AUTHZ_DENIED_TOTAL
 
 
 def _client_ip(request: Request) -> str | None:
@@ -68,6 +69,7 @@ async def authorize_user_access(
     """
     allowed = await _check_user_access(session, actor, user_id)
     if not allowed:
+        AUTHZ_DENIED_TOTAL.labels(action="user_access").inc()
         await write_audit_log(
             session,
             actor_id=actor.id,
@@ -99,6 +101,7 @@ async def authorize_device_access(
 
     allowed = await _check_user_access(session, actor, device.user_id)
     if not allowed:
+        AUTHZ_DENIED_TOTAL.labels(action="device_access").inc()
         await write_audit_log(
             session,
             actor_id=actor.id,

@@ -5,6 +5,10 @@ services:
     image: redis:7-alpine
     ports: ["6379:6379"]
     volumes: ["redis_data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
 
   # Kafka-protocol broker for raw-signals/features (week1-2-layer1-guide.md
   # decision: Redpanda over Kafka+ZooKeeper — one container, same wire
@@ -24,6 +28,10 @@ services:
       - --advertise-kafka-addr=PLAINTEXT://redpanda:9092,PLAINTEXT_HOST://localhost:29092
     ports: ["29092:29092", "9644:9644"]
     volumes: ["redpanda_data:/var/lib/redpanda/data"]
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health"]
+      interval: 5s
+      retries: 20
 
   postgres:
     image: postgres:16-alpine
@@ -33,6 +41,10 @@ services:
       POSTGRES_PASSWORD: vitalstream
       POSTGRES_DB: vitalstream
     volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "vitalstream"]
+      interval: 5s
+      retries: 10
 
   timescaledb:
     image: timescale/timescaledb:latest-pg16
@@ -55,16 +67,34 @@ services:
 
   prometheus:
     image: prom/prometheus:latest
+    # --web.enable-remote-write-receiver: lets `k6 run -o
+    # experimental-prometheus-rw` push its own client-side metrics into the
+    # same Prometheus instance, so a load test's request-generator view and
+    # the system's own server-side view sit in the same Grafana dashboard.
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-remote-write-receiver
     ports: ["9090:9090"]
     volumes:
       - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
 
   grafana:
     image: grafana/grafana:latest
     ports: ["3001:3000"]
     environment:
       GF_SECURITY_ADMIN_PASSWORD: admin
-    volumes: ["grafana_data:/var/lib/grafana"]
+      # Anonymous read-only access (week8 Step 2) — a demo recording or a
+      # quick "look at the dashboard" doesn't need a login prompt first.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - grafana_data:/var/lib/grafana
+      # One mount, not two nested ones (the dashboard JSON lives under
+      # provisioning/dashboards/files/ precisely so it can) — Docker can't
+      # create a mountpoint inside an already-read-only bind mount.
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on: [prometheus]
 
   # Application services build from local Dockerfiles. Each builds with the
   # repo root as context so it can COPY libs/common. ingestion's Dockerfile
@@ -91,7 +121,15 @@ services:
       POSTGRES_DSN: postgresql+asyncpg://vitalstream:vitalstream@postgres:5432/vitalstream
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
     ports: ["8001:8001"]
-    depends_on: [redpanda, postgres, jaeger]
+    depends_on:
+      redpanda: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      jaeger: { condition: service_started }
+    healthcheck: &http_healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8001/healthz')"]
+      interval: 5s
+      retries: 15
+      start_period: 10s
 
   feature_extraction:
     build: { context: ., dockerfile: services/feature_extraction/Dockerfile }
@@ -101,7 +139,27 @@ services:
       POSTGRES_DSN: postgresql+asyncpg://vitalstream:vitalstream@postgres:5432/vitalstream
       CONFIG_SERVICE_BASE_URL: http://config_service:8002
       OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
-    depends_on: [redpanda, postgres, jaeger]
+    # week8 Step 5: SYS_PTRACE so `docker exec ... py-spy record` can attach
+    # to the consumer loop's PID 1 for a flame graph if load testing finds
+    # this service is the bottleneck (it's the CPU-bound one — bandpass
+    # filter + peak detection per window, not I/O). Denied by Docker's
+    # default seccomp/capability set otherwise, even for same-container
+    # introspection.
+    cap_add: [SYS_PTRACE]
+    ports: ["9101:9101"]
+    depends_on:
+      redpanda: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      jaeger: { condition: service_started }
+    # No HTTP app (Kafka consumer loop) — the metrics server (week8 Step 1)
+    # doubles as the healthcheck endpoint; any response means the process
+    # got far enough to call start_http_server(), which only happens after
+    # the Kafka consumer/producer/Postgres store all started successfully.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:9101/')"]
+      interval: 5s
+      retries: 15
+      start_period: 10s
 
   config_service:
     build: { context: ., dockerfile: services/config_service/Dockerfile }
@@ -109,7 +167,11 @@ services:
     environment:
       POSTGRES_DSN: postgresql+asyncpg://vitalstream:vitalstream@postgres:5432/vitalstream
     ports: ["8002:8002"]
-    depends_on: [postgres]
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      <<: *http_healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8002/healthz')"]
 
   # insight_service ships two distinct entrypoints (see its Dockerfile /
   # README "Insights pipeline"): `.main`, the RBAC-gated on-demand HTTP
@@ -127,7 +189,13 @@ services:
       POSTGRES_DSN: postgresql+asyncpg://vitalstream:vitalstream@postgres:5432/vitalstream
       REDIS_URL: redis://redis:6379/0
     ports: ["8003:8003"]
-    depends_on: [redis, redpanda, postgres]
+    depends_on:
+      redis: { condition: service_healthy }
+      redpanda: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    healthcheck:
+      <<: *http_healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8003/healthz')"]
 
   insight_service_consumer:
     build: { context: ., dockerfile: services/insight_service/Dockerfile }
@@ -137,7 +205,16 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: redpanda:9092
       POSTGRES_DSN: postgresql+asyncpg://vitalstream:vitalstream@postgres:5432/vitalstream
       REDIS_URL: redis://redis:6379/0
-    depends_on: [redis, redpanda, postgres]
+    ports: ["9102:9102"]
+    depends_on:
+      redis: { condition: service_healthy }
+      redpanda: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:9102/')"]
+      interval: 5s
+      retries: 15
+      start_period: 10s
 
   api:
     build: { context: ., dockerfile: services/api/Dockerfile }
@@ -147,7 +224,12 @@ services:
       INSIGHT_SERVICE_BASE_URL: http://insight_service:8003
       CONFIG_SERVICE_BASE_URL: http://config_service:8002
     ports: ["8000:8000"]
-    depends_on: [postgres, insight_service]
+    depends_on:
+      postgres: { condition: service_healthy }
+      insight_service: { condition: service_healthy }
+    healthcheck:
+      <<: *http_healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/healthz')"]
 
   # week7 Step 10: BFF frontend — API_BASE_URL points at the api container
   # by its compose service name, not localhost:8000 (that's only correct
@@ -157,7 +239,13 @@ services:
     ports: ["3000:3000"]
     environment:
       API_BASE_URL: http://api:8000
-    depends_on: [api]
+    depends_on:
+      api: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/login', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 5s
+      retries: 15
+      start_period: 10s
 
 volumes:
   redis_data:

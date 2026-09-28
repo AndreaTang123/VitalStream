@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     postgres_dsn: str = "postgresql+asyncpg://vitalstream:vitalstream@localhost:5432/vitalstream"
     # TimescaleDB hypertable for raw signal storage — Week 3+ (PRD 4.1), unused for now.
     timescale_dsn: str = "postgresql+asyncpg://vitalstream:vitalstream@localhost:5433/vitalstream_timeseries"
+    # week8 Step 1: no HTTP server of its own, so /metrics gets its own port
+    # via prometheus_client.start_http_server rather than piggybacking on a
+    # FastAPI app.
+    metrics_port: int = 9101
 
 
 settings = Settings()

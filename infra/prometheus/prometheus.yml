@@ -1,19 +1,33 @@
-# TODO: none of the services expose a /metrics endpoint yet (PRD week 8 —
-# "打磨" — is where Prometheus instrumentation gets added). These targets are
-# where they'll live once prometheus-fastapi-instrumentator or similar is wired in.
+# week8 Step 1/2: real scrape targets, now that ingestion/api/
+# feature_extraction/insight_service_consumer all actually export /metrics
+# (prometheus-fastapi-instrumentator for the two HTTP services; a
+# standalone prometheus_client.start_http_server for the two Kafka
+# consumers — see each service's metrics.py).
+#
+# Targets are compose service names + each container's *internal* port
+# (not the host-mapped one) — Prometheus itself runs inside the compose
+# network, so it reaches every other container by its service name.
 global:
-  scrape_interval: 15s
+  scrape_interval: 5s
 
 scrape_configs:
   - job_name: ingestion
     static_configs:
-      - targets: ["host.docker.internal:8001"]
-  - job_name: config_service
-    static_configs:
-      - targets: ["host.docker.internal:8002"]
-  - job_name: insight_service
-    static_configs:
-      - targets: ["host.docker.internal:8003"]
+      - targets: ["ingestion:8001"]
   - job_name: api
     static_configs:
-      - targets: ["host.docker.internal:8000"]
+      - targets: ["api:8000"]
+  - job_name: feature_extraction
+    static_configs:
+      - targets: ["feature_extraction:9101"]
+  - job_name: insight_service_consumer
+    static_configs:
+      - targets: ["insight_service_consumer:9102"]
+  # config_service and insight_service's on-demand HTTP app deliberately
+  # have no /metrics endpoint — neither is on the hot path this week's
+  # metrics are meant to observe (config_service is a low-frequency admin
+  # API; insight_service.main's on-demand generate is already covered by
+  # api's own http_request_duration_seconds when a user hits /generate).
+
+rule_files:
+  - /etc/prometheus/alerts.yml

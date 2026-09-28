@@ -10,12 +10,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 from aiokafka import AIOKafkaProducer
 from opentelemetry import propagate
 from vitalstream_common.schemas import SignalBatch
 
 from ingestion.config import settings
+from ingestion.metrics import INGEST_SAMPLES_TOTAL, KAFKA_PRODUCE_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -55,13 +57,20 @@ class SignalProducer:
         carrier: dict[str, str] = {}
         propagate.inject(carrier)
         headers = [(k, v.encode("utf-8")) for k, v in carrier.items()]
+        # week8 Step 1: a second, independent use of the same "smuggle
+        # metadata through Kafka headers" trick — this is what lets
+        # feature_extraction compute a real ingest-to-feature-write
+        # pipeline latency later, not just its own local processing time.
+        headers.append(("ingest_ts", str(time.time()).encode("utf-8")))
 
-        future = await self._producer.send(
-            settings.raw_signals_topic,
-            value=batch.model_dump(mode="json"),
-            key=str(batch.device_id).encode("utf-8"),
-            headers=headers,
-        )
+        with KAFKA_PRODUCE_SECONDS.time():
+            future = await self._producer.send(
+                settings.raw_signals_topic,
+                value=batch.model_dump(mode="json"),
+                key=str(batch.device_id).encode("utf-8"),
+                headers=headers,
+            )
+        INGEST_SAMPLES_TOTAL.inc(len(batch.values))
         future.add_done_callback(_log_if_failed)
 
 

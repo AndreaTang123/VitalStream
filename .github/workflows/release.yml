@@ -1,0 +1,68 @@
+name: release
+
+# week8 Step 8: push images to GHCR on every main push and on version tags.
+# Deliberately stops there — no Kubernetes, no cloud deploy pipeline. A
+# single VM running `docker compose -f docker-compose.prod.yml pull && up
+# -d` against these images is the whole "CD" story this week, per the
+# guide's explicit "K8s 一周做不好，面试也讲不透，还要持续花钱" call.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: ingestion
+            dockerfile: services/ingestion/Dockerfile
+          - name: feature-extraction
+            dockerfile: services/feature_extraction/Dockerfile
+          - name: config-service
+            dockerfile: services/config_service/Dockerfile
+          - name: insight-service
+            dockerfile: services/insight_service/Dockerfile
+          - name: api
+            dockerfile: services/api/Dockerfile
+          - name: frontend
+            dockerfile: frontend/Dockerfile
+            context: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # GHCR requires a lowercase image path; github.repository_owner isn't
+      # guaranteed to be (this repo's owner has mixed case).
+      - run: echo "OWNER_LC=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ env.OWNER_LC }}/vitalstream-${{ matrix.name }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context || '.' }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}

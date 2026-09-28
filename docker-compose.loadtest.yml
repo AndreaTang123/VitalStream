@@ -1,0 +1,16 @@
+# week8: overlay for load testing (and CI's e2e job) — `docker compose -f
+# docker-compose.yml -f docker-compose.loadtest.yml up -d`. Only changes
+# LLM_MODE: a 500-1000 device load test can trigger hundreds of throttled
+# InsightRequests, and none of that should hit real OpenAI (cost, and
+# uncontrolled latency polluting numbers that are supposed to be about
+# *this system's* bottlenecks, not OpenAI's). Every real LLM-quality number
+# (grounded_rate, hallucination_rate, cache hit rate, $ saved) already comes
+# from Week 5's real-OpenAI runs — see benchmarks/week5_eval_report.md —
+# and is never re-measured against the mock.
+services:
+  insight_service:
+    environment:
+      LLM_MODE: mock
+  insight_service_consumer:
+    environment:
+      LLM_MODE: mock

@@ -1,0 +1,18 @@
+# week8 Step 2: one Grafana entry point for both metrics and traces —
+# Jaeger as a datasource means a Grafana panel can deep-link straight into
+# a trace, not just a latency number.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+
+  - name: Jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    editable: false

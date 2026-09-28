@@ -6,19 +6,33 @@ evaluated LLM health insights, and serves them through a JWT/RBAC-secured
 FastAPI + Next.js full-stack app — with an audit log for every cross-user access.*
 
 [![CI](https://github.com/AndreaTang123/VitalStream/actions/workflows/ci.yml/badge.svg)](https://github.com/AndreaTang123/VitalStream/actions/workflows/ci.yml)
+[![release](https://github.com/AndreaTang123/VitalStream/actions/workflows/release.yml/badge.svg)](https://github.com/AndreaTang123/VitalStream/actions/workflows/release.yml)
 ![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
 ![Next.js](https://img.shields.io/badge/next.js-14-black?logo=next.js&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-async-009688?logo=fastapi&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-100%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-101%20passing-brightgreen)
 
 Real PPG-DaLiA wearable data in, real OpenAI-generated advice out, real
-Postgres-backed accounts and audit trail — nothing in this repo is mocked.
+Postgres-backed accounts and audit trail — every screenshot and number
+below is a genuine record (`LLM_MODE=mock` exists solely for load testing
+and CI, where hitting real OpenAI would be slow, costly, and nondeterministic
+— see [Results](#results) for exactly where it's used and where it isn't).
 See [docs/PRD.md](docs/PRD.md) for the full product requirements doc.
 
 ![Patient dashboard](docs/screenshots/patient-dashboard.png)
 
 ## Highlights
 
+- **Load-tested with k6's open-arrival model to a real, found ceiling**:
+  500 simulated devices (32,000 samples/sec, real PPG-DaLiA payloads)
+  sustained at P99 190.6ms; 1000 breaches the 200ms SLO outright. Kafka
+  consumer lag stayed at 0 throughout — `docker stats` + Grafana together
+  point the failure squarely at `ingestion`'s single uvicorn worker, not
+  the signal-processing pipeline. [Full sweep + bottleneck analysis →](benchmarks/week8_load_test_results.md)
+- **A real Grafana dashboard, provisioned as code**, not clicked together —
+  fresh `docker compose up` shows live req/s, pipeline latency, cache hit
+  rate, and RBAC denials with zero manual setup.
+  [Screenshot →](#observability)
 - **~4.8x throughput / ~6.5x P50 latency** on the ingestion path from fixing one
   bug (a `send_and_wait()` call that accidentally blocked every HTTP response
   on a Kafka ack) — 384.9 → 1841.8 req/s, P50 25.8ms → 4.0ms, same machine,
@@ -42,7 +56,7 @@ See [docs/PRD.md](docs/PRD.md) for the full product requirements doc.
   audit log's "denied only" filter. [Screenshots below ↓](#interface-screenshots)
 - **BFF auth**: access/refresh JWTs live only in httpOnly cookies the browser
   can't read — the Next.js server, not client JS, holds every token.
-- **92% test coverage** on the `api` service (100 tests passing across all 7
+- **92% test coverage** on the `api` service (101 tests passing across all 7
   Python packages), including a route-sweep meta-test that fails the build
   if any future endpoint forgets its auth dependency.
 
@@ -131,16 +145,36 @@ sequenceDiagram
 
 </details>
 
-Cross-cutting: OpenTelemetry distributed tracing (Jaeger), Docker Compose for
-every service, GitHub Actions CI (lint + test each Python package, lint +
-build the frontend). Everything in the diagram is actually implemented and
-wired into `docker-compose.yml` — nothing here is aspirational; see
+Cross-cutting: OpenTelemetry distributed tracing (Jaeger), Prometheus +
+Grafana metrics (Week 8), GitHub Actions CI/CD (lint + test + a real-
+Postgres migration check + a full-stack Playwright E2E job, images pushed
+to GHCR). Everything in the diagram is actually implemented and wired into
+`docker-compose.yml` — nothing here is aspirational; see
 [Limitations](#limitations--future-work) for what's explicitly *not* built
-yet (Prometheus/Grafana metrics, k6 load testing, TimescaleDB).
+(TimescaleDB, Kubernetes, Alertmanager routing).
 
 ## Results
 
-**Ingestion throughput** (same machine, concurrency=10, 15s, `benchmarks/load_test.py`):
+**k6 device-count sweep** (real PPG-DaLiA payloads, open-arrival-rate load,
+`LLM_MODE=mock`; SLO: HTTP P99 < 200ms, error rate < 1%, no Kafka lag growth
+— defined *before* the run in `benchmarks/README.md`):
+
+| Devices | Samples/sec | P99 latency | Stable? |
+|---|---|---|---|
+| 250 | 16,001 | 12.5ms | ✅ |
+| **500** | **32,000** | **190.6ms** | ✅ (at the SLO's edge) |
+| 1000 | 63,426 | 1,323.9ms | ❌ SLO breached |
+
+**Max stable load on this single-laptop setup: 500 simulated devices
+(32,000 samples/sec)**, P99 latency 190.6ms. Kafka consumer lag stayed at
+**0 through every tier, including 1000** — ruling out
+`feature_extraction`'s signal-processing compute as the cause; `docker
+stats` instead shows `ingestion`'s single uvicorn worker process pegged
+over 100% CPU at the point of failure, confirming a bottleneck **Week 3's
+own report predicted but didn't yet have the load-testing setup to prove**.
+[Full sweep, bottleneck analysis, and the Week 3→8 connection →](benchmarks/week8_load_test_results.md)
+
+**Ingestion throughput, before vs. after one fix** (same machine, concurrency=10, 15s, `benchmarks/load_test.py`):
 
 | | RPS | P50 | P95 | P99 |
 |---|---|---|---|---|
@@ -174,7 +208,20 @@ scale, not from one device running longer.
 
 ## Key Design Decisions
 
-Six choices worth defending in an interview, each: what, why, what it costs.
+Seven choices worth defending in an interview, each: what, why, what it costs.
+
+- **k6 for load testing, not Locust — chosen for the open-arrival model,
+  not just because it's "another language."** k6's `constant-arrival-rate`
+  executor fires N requests/sec regardless of how fast the previous one
+  answered; Locust's default is closed-model (wait for a response, then
+  send the next), which means a slowing system quietly lowers its own
+  offered load and *understates* latency — coordinated omission. "N devices
+  each reporting once a second" only means what it says under an open
+  model. Cost: one more non-Python tool in the stack, and it's Go, not
+  Python — the opposite of this project's "unify on Python" theme, worth
+  it specifically because the load generator itself must not become the
+  bottleneck it's trying to measure (see [Results](#results) for the
+  environment note on why that still isn't fully solved on one laptop).
 
 - **Redpanda + aiokafka, `device_id` as the Kafka message key** (raw-signals,
   features, and features-extracted topics all key by it). Guarantees
@@ -297,11 +344,40 @@ POST /api/v1/devices/{id}/signals   (ingestion, HTTP)
    └─ write features row (postgres)
 ```
 
-Prometheus/Grafana containers run (`docker-compose.yml`), but no service
-exports a `/metrics` endpoint yet — the scrape config
-(`infra/prometheus/prometheus.yml`) is honestly labeled `TODO` rather than
-silently absent. This is explicit Week 8 scope; see
-[Limitations](#limitations--future-work).
+**Metrics are real as of Week 8** — `docker compose up -d` brings up
+Grafana at [localhost:3001](http://localhost:3001) (anonymous viewer
+access, no login needed) with one dashboard, provisioned as code
+(`infra/grafana/provisioning/`), auto-loaded on every fresh start:
+
+![Grafana dashboard](docs/screenshots/grafana-dashboard.png)
+
+Four rows: **Ingestion** (req/s, samples/s, HTTP P50/P95/P99, error rate),
+**Pipeline** (Kafka consumer lag, end-to-end latency ingest→Postgres,
+feature windows/sec *by `algo_version`* — a gray-release rollout made
+visible as two lines whose ratio tracks `rollout_pct`, and one line
+dropping to zero on rollback), **AI** (cache hit rate, LLM latency,
+cumulative real spend), **Platform** (api error rate, RBAC denials/hour by
+action, service `up`). Screenshot above is from a real 50-device load-test
+run — see [Results](#results) for what the numbers mean.
+
+Three Prometheus alert rules (`infra/prometheus/alerts.yml`) — growing
+consumer lag, high error rate, P99-over-SLO — fire in Prometheus's own
+Alerts UI ([localhost:9090/alerts](http://localhost:9090/alerts)); not
+wired to Alertmanager/Slack, which was explicitly out of scope this week
+(see [Limitations](#limitations--future-work)).
+
+**Where each metric comes from**: `ingestion` and `api` get the generic
+`http_request_duration_seconds` histogram for free from
+`prometheus-fastapi-instrumentator`, plus a couple of hand-added business
+counters (`ingest_samples_total`, `authz_denied_total`) that a generic HTTP
+histogram can't express. `feature_extraction` and
+`insight_service.consumer` have no HTTP server of their own (they're Kafka
+consumer loops) — each runs its own standalone metrics server
+(`prometheus_client.start_http_server`, ports 9101/9102). No metric anywhere
+is labeled by `device_id`/`user_id`/`actor_id` — with a 1000-device load
+test that's thousands of time series per histogram bucket, the exact
+cardinality blowup that makes Prometheus fall over; device-level detail
+belongs in Postgres, not here.
 
 ## Security
 
@@ -334,21 +410,36 @@ The baseline checklist, walked and checked off against the real code:
 
 ## Testing & CI
 
-- **100 tests passing** across 7 Python packages (`make test`); `api` alone
-  has 42, at 92% statement coverage (`pytest --cov`).
+- **101 tests passing** across 7 Python packages (`make test`); `api`
+  alone is ~92% statement coverage (`pytest --cov`, tracked in CI —
+  `.github/workflows/ci.yml` uploads it as a build artifact every run).
 - The permission matrix is the highest-value suite:
   `services/api/tests/test_rbac.py` parametrizes 3 roles × own/authorized/
   unauthorized across the read endpoints; `test_route_auth.py` is a
   structural sweep that fails the build if a future endpoint forgets its
   auth dependency; `test_audit.py` asserts cross-user reads *do* write an
-  audit row and self-reads *don't*.
-- 4 Playwright specs (`frontend/e2e/`) encode the three end-to-end
-  acceptance claims (patient sees real data + generates an insight; coach
-  is authorized/denied correctly; operator's rollback shows up in the
-  audit log) — they need the full stack + seed data running, so they're
-  not yet in CI (`make frontend-e2e` runs them locally).
-- CI (`.github/workflows/ci.yml`) runs on every push/PR: lint + pytest for
-  each Python package, `next lint` + `next build` for the frontend.
+  audit row and self-reads *don't*; `test_llm_mock_mode.py` asserts
+  `LLM_MODE=mock` never touches the real OpenAI client — a load test or CI
+  run silently making real API calls would be a much worse bug than a
+  failing test.
+- **CI is three jobs**, not one (`.github/workflows/ci.yml`):
+  - `python-services` — lint + pytest per package, `LLM_MODE=mock`
+    throughout, coverage uploaded for `api`.
+  - `db-migrations` — `alembic upgrade head` against a **real** Postgres
+    service container, not sqlite. This is the job that would have caught
+    every Postgres-only bug this week's live-verification pass found by
+    hand (StrEnum value mismatch, a reserved-word column name, asyncpg
+    type-inference failures) — see [Results](#results) and the Week 8
+    entry in git log for the full list. Sqlite-backed unit tests structurally
+    cannot catch this class of bug; only a real Postgres in CI can.
+  - `e2e` — the full stack via `docker compose ... --wait` (every service
+    now has a real healthcheck, not just "container started"), migrated,
+    seeded, then the 4 Playwright specs (`frontend/e2e/`) against it.
+- **CD** (`.github/workflows/release.yml`) builds and pushes all 6
+  application images to GHCR on every push to `main` and on `v*` tags.
+  `docker-compose.prod.yml` is the "any VM with Docker" deploy story this
+  project stops at — deliberately no Kubernetes (see
+  [Limitations](#limitations--future-work)).
 
 ## Project Structure
 
@@ -362,11 +453,17 @@ services/
   api/                 Layer 3 — FastAPI backend: OAuth2/JWT auth, two-layer RBAC, audit log, Alembic migrations
 libs/common/           Shared Pydantic schemas + telemetry helpers used across services
 frontend/              Layer 3 — Next.js dashboard: BFF cookie auth, patient/coach/operator views
-scripts/               scripts/seed.py — demo accounts/devices/coach grants for local dev
-infra/                 Prometheus/Grafana configs, k6 load-test script (Week 8), cloud VM bootstrap
+scripts/               scripts/seed.py — demo accounts/devices/coach grants (+ --load-devices for k6)
+loadtest/              k6 script, real-PPG payload prep, tiered runner (Week 8)
+infra/                 Prometheus/Grafana provisioning (dashboards + alerts as code), cloud VM bootstrap
+benchmarks/            Real measured results — throughput, eval, cache, load test (week8_load_test_results.md)
 data/                  Dataset download script + local data cache (gitignored)
 docs/                  PRD, architecture notes, screenshots
 ```
+
+`docker-compose.loadtest.yml` and `docker-compose.prod.yml` are override
+files, not standalone stacks — see [Quick Start](#quick-start) and
+[Results](#results) for how each is actually invoked.
 
 ## Limitations & Future Work
 
@@ -378,22 +475,28 @@ signal of engineering judgment as what is:
   lifestyle text, not clinical guidance — the PRD is explicit about this.
 - **No real device or hospital data.** Every signal replayed is from public
   research datasets (PPG-DaLiA), never a real patient.
-- **No production HA.** Single-instance deployment; the in-process rate
-  limiter and refresh-token single-flight both assume one process.
-- **Prometheus/Grafana metrics are not wired up yet** — containers run, but
-  no service exports `/metrics`. Distributed tracing (Jaeger) *is* real and
-  working; metrics are the gap.
-- **Load testing so far uses a hand-rolled `httpx`/asyncio script**
-  (`benchmarks/load_test.py`), not the k6 scenario scaffolded in
-  `infra/k6/load_test.js`. The custom script was what actually let the
-  investigation isolate which layer (event loop vs. batching window vs.
-  client connection pool) was the real bottleneck at each step — see
-  [benchmarks/results.md](benchmarks/results.md) for that walkthrough. A
-  proper multi-VU k6 sweep is Week 8 scope.
+- **No production HA.** Single-instance deployment (single uvicorn worker
+  per service, not swept as a variable this week — see
+  [Results](#results)); the in-process rate limiter and refresh-token
+  single-flight both assume one process.
 - **No TimescaleDB.** Raw/derived signals live in plain Postgres; at this
   project's data volume, a hypertable would be premature optimization.
-- **No CI for the Playwright E2E suite** — it needs a live seeded stack,
-  which GitHub Actions doesn't currently provision.
+- **No Kubernetes / cloud deploy pipeline.** Week 8's CD stops at "push
+  images to GHCR" + a `docker-compose.prod.yml` for a single VM — a
+  deliberate scope cut (see that section's own comment for why).
+- **Alerts fire in Prometheus's UI only** — not wired to Alertmanager/
+  Slack/email. Three rules exist (`infra/prometheus/alerts.yml`); routing
+  them anywhere was out of this week's scope.
+- **No OpenAPI type-drift check in CI.** `frontend/lib/api-types.ts` is
+  still hand-written (Week 7), not generated — a drift check comparing it
+  against a generated file would fail immediately and for the wrong
+  reason. Worth adding once that file is actually generated from a live
+  `api` build, not before.
+- **The load test ran on a single laptop that was also running k6
+  itself** — not a separate load-generator host. Every number in
+  [Results](#results) is a conservative floor because of that, not a
+  clean isolated measurement; `benchmarks/README.md` says so explicitly
+  rather than presenting it as more rigorous than it is.
 - **HIPAA/GDPR**: only the *engineering practices* associated with
   compliance (audit logging, RBAC, encrypted-in-transit auth) are
   implemented — this is not a certified-compliant system.

@@ -11,7 +11,12 @@ import uvloop
 
 def main() -> None:
     uvloop.install()
-    uvicorn.run("ingestion.main:app", host="0.0.0.0", port=8001, loop="uvloop")
+    # week8 Step 3: per-request access logging is real per-request overhead
+    # on the hottest path in the system — fine at dev traffic, measurably
+    # not fine once benchmarks/RESULTS.md's load test is pushing hundreds
+    # of req/s through here. warning-level (not the uvicorn default info)
+    # so a load test measures the endpoint, not the logger.
+    uvicorn.run("ingestion.main:app", host="0.0.0.0", port=8001, loop="uvloop", log_level="warning")
 
 
 if __name__ == "__main__":

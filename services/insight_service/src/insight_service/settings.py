@@ -25,5 +25,18 @@ class Settings(BaseSettings):
     judge_model_name: str = "gpt-4o-mini"
     judge_timeout_seconds: float = 15.0
 
+    # week8 Step 1: no HTTP server of its own for the consumer, so /metrics
+    # gets its own port via prometheus_client.start_http_server.
+    metrics_port: int = 9102
+
+    # week8: "LLM_MODE=mock" for load testing and CI — real numbers
+    # (grounded_rate, hallucination_rate, cache hit rate, $ saved) all come
+    # from Week 5's real-OpenAI runs (benchmarks/week5_eval_report.md) and
+    # are never re-measured against the mock. Mock mode exists so load
+    # testing doesn't burn real API spend and CI doesn't need a real key.
+    llm_mode: str = "real"
+    llm_mock_latency_seconds: float = 0.8
+
+
 
 settings = Settings()

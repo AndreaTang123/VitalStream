@@ -7,6 +7,7 @@ compare eval scores/latency/cost across versions.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -17,6 +18,12 @@ from insight_service.pricing import calculate_cost_usd
 from insight_service.settings import settings
 
 logger = logging.getLogger(__name__)
+
+# week8: a fixed, obviously-not-real response — never mistakeable for a
+# genuine model output in a screenshot or log line.
+_MOCK_CONTENT = "[MOCK] Great job staying active — keep up the healthy habits!"
+_MOCK_PROMPT_TOKENS = 42
+_MOCK_COMPLETION_TOKENS = 18
 
 # Each version is a (system, user_template) pair rather than one flat string,
 # so a version can tighten *system*-level constraints without changing how
@@ -126,6 +133,16 @@ class LLMClient:
     async def _call_with_retry(
         self, model: str, system: str, user_content: str
     ) -> tuple[str, float, int, int]:
+        if settings.llm_mode == "mock":
+            # week8 Step 1: sleeps a realistic-ish latency rather than
+            # returning instantly, so load-test histograms/lag numbers stay
+            # meaningful (an instant mock would make the AI layer look
+            # infinitely fast, which is a different kind of dishonest number
+            # than a real-but-uncontrolled OpenAI call would be).
+            start = time.monotonic()
+            await asyncio.sleep(settings.llm_mock_latency_seconds)
+            return _MOCK_CONTENT, (time.monotonic() - start) * 1000, _MOCK_PROMPT_TOKENS, _MOCK_COMPLETION_TOKENS
+
         """One retry on failure (week4-layer2-milestone-guide.md Step 5) — a
         transient timeout/rate-limit shouldn't skip an insight outright, but
         this consumer also shouldn't hang on a full retry queue this week.

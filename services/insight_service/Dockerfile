@@ -8,5 +8,5 @@ COPY services/insight_service /app
 
 RUN pip install --no-cache-dir -e /libs/common -e .
 
-EXPOSE 8003
+EXPOSE 8003 9102
 CMD ["uvicorn", "insight_service.main:app", "--host", "0.0.0.0", "--port", "8003"]

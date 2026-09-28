@@ -1,0 +1,35 @@
+# week8 Step 8: "any machine with Docker can pull this up" — references the
+# GHCR images release.yml publishes instead of building locally. Infra
+# containers (Postgres, Redpanda, Redis, Prometheus, Grafana) are identical
+# to docker-compose.yml; only the six application services swap `build:`
+# for `image:`.
+#
+# Usage on a fresh VM:
+#   GHCR_OWNER=<lowercase github username> docker compose \
+#     -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# A public demo deployment MUST set LLM_MODE=mock or a strict OpenAI budget
+# cap — an unauthenticated public IP hitting a real-money endpoint is a
+# guaranteed way to get the API key drained (see README "Limitations").
+services:
+  ingestion:
+    build: !reset null
+    image: ghcr.io/${GHCR_OWNER:-andreatang123}/vitalstream-ingestion:latest
+  feature_extraction:
+    build: !reset null
+    image: ghcr.io/${GHCR_OWNER:-andreatang123}/vitalstream-feature-extraction:latest
+  config_service:
+    build: !reset null
+    image: ghcr.io/${GHCR_OWNER:-andreatang123}/vitalstream-config-service:latest
+  insight_service:
+    build: !reset null
+    image: ghcr.io/${GHCR_OWNER:-andreatang123}/vitalstream-insight-service:latest
+  insight_service_consumer:
+    build: !reset null
+    image: ghcr.io/${GHCR_OWNER:-andreatang123}/vitalstream-insight-service:latest
+  api:
+    build: !reset null
+    image: ghcr.io/${GHCR_OWNER:-andreatang123}/vitalstream-api:latest
+  frontend:
+    build: !reset null
+    image: ghcr.io/${GHCR_OWNER:-andreatang123}/vitalstream-frontend:latest

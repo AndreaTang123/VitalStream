@@ -1,0 +1,17 @@
+# week8 Step 2: "dashboards as code" — points at infra/grafana/dashboards/,
+# so a fresh `docker compose up` shows the real panels with no manual
+# clicking. Export-to-JSON (from the Grafana UI) back into that folder
+# whenever a panel is tweaked, rather than letting the running instance's
+# state be the only copy.
+apiVersion: 1
+
+providers:
+  - name: vitalstream
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/files

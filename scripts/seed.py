@@ -16,16 +16,29 @@ Idempotent: re-running skips anything that already exists by email/device id.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import json
 import uuid
 from datetime import UTC, datetime
-
-from sqlalchemy import select
-from vitalstream_common.schemas import DeviceStatus, Role
+from pathlib import Path
 
 from api.auth import hash_password
 from api.db.base import AsyncSessionLocal
 from api.db.models import CoachPatientORM, DeviceORM, UserORM
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from vitalstream_common.schemas import DeviceStatus, Role
+
+LOADTEST_EMAIL = "loadtest@vitalstream.dev"
+_LOADTEST_DEVICE_NAMESPACE = uuid.UUID("b8b3f2b0-6b1a-4b2e-9c1a-2f6a8b0c4d3e")
+
+
+def loadtest_device_uuid(index: int) -> uuid.UUID:
+    """Deterministic (uuid5, not uuid4) so re-running --load-devices is
+    idempotent — same ids every time, so the ON CONFLICT DO NOTHING bulk
+    insert actually dedupes instead of piling up new rows each run."""
+    return uuid.uuid5(_LOADTEST_DEVICE_NAMESPACE, f"loadtest-device-{index}")
 
 DEMO_PASSWORD = "password123"
 
@@ -114,7 +127,35 @@ async def _grant_coach_access(session, coach: UserORM, patient: UserORM, granted
     print(f"granted {coach.email} access to {patient.email}")
 
 
-async def seed() -> None:
+async def _bulk_register_load_devices(session, owner: UserORM, count: int) -> list[uuid.UUID]:
+    """week8 Step 3: ingestion rejects any device_id that isn't a `devices`
+    row (week6), so a load test needs its devices registered first. Bulk
+    `INSERT ... ON CONFLICT DO NOTHING` rather than one-row-at-a-time ORM
+    inserts — at a few thousand devices, per-row round trips would make
+    *seeding* the slow part of the load test setup."""
+    now = datetime.now(UTC)
+    device_ids = [loadtest_device_uuid(i) for i in range(count)]
+    rows = [
+        {
+            "id": device_id,
+            "user_id": owner.id,
+            "device_type": "loadtest",
+            "status": DeviceStatus.ACTIVE,
+            "bound_at": now,
+        }
+        for device_id in device_ids
+    ]
+    # Batch the insert (a single 5000-row VALUES list is a lot of SQL text)
+    # rather than one INSERT per device.
+    batch_size = 1000
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start : start + batch_size]
+        stmt = pg_insert(DeviceORM).values(batch).on_conflict_do_nothing(index_elements=["id"])
+        await session.execute(stmt)
+    return device_ids
+
+
+async def seed(load_devices: int = 0) -> None:
     async with AsyncSessionLocal() as session:
         users = {
             email: await _get_or_create_user(session, email, role, name)
@@ -130,11 +171,34 @@ async def seed() -> None:
 
         await session.commit()
 
+        load_device_ids: list[uuid.UUID] = []
+        if load_devices > 0:
+            loadtest_user = await _get_or_create_user(
+                session, LOADTEST_EMAIL, Role.PATIENT, "Load Test Fleet"
+            )
+            await session.commit()
+            load_device_ids = await _bulk_register_load_devices(session, loadtest_user, load_devices)
+            await session.commit()
+
     print("\nDemo devices (pass to the simulator with --device-id):")
     for owner_email, subject in DEVICES:
         print(f"  {subject}: --device-id {device_uuid(subject)}  (owner: {owner_email})")
     print(f"\nAll seeded users share the password: {DEMO_PASSWORD}")
 
+    if load_device_ids:
+        out_path = Path(__file__).resolve().parent.parent / "loadtest" / "data" / "devices.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps([str(d) for d in load_device_ids]))
+        print(f"\nRegistered {len(load_device_ids)} load-test devices -> {out_path}")
+
 
 if __name__ == "__main__":
-    asyncio.run(seed())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--load-devices",
+        type=int,
+        default=0,
+        help="also bulk-register this many devices (bound to a dedicated loadtest@ user) for k6",
+    )
+    args = parser.parse_args()
+    asyncio.run(seed(load_devices=args.load_devices))

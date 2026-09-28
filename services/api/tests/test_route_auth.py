@@ -14,6 +14,7 @@ from api.main import app
 # the auth endpoints a not-yet-authenticated caller must be able to reach.
 _PUBLIC_PATHS = {
     "/healthz",
+    "/metrics",  # week8 Step 1: Prometheus scrapes this with no bearer token
     "/docs",
     "/openapi.json",
     "/redoc",

@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -28,6 +29,7 @@ from uuid import UUID
 import numpy as np
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from opentelemetry import propagate, trace
+from prometheus_client import start_http_server
 from vitalstream_common.schemas import Feature, InsightRequest, SignalBatch, SignalType
 from vitalstream_common.telemetry import configure_tracing
 
@@ -35,6 +37,12 @@ from feature_extraction.config_client import config_client, resolve_algo_version
 from feature_extraction.db import FeatureStore
 from feature_extraction.features import ALGO_VERSION_V1, HEART_RATE_ALGORITHMS
 from feature_extraction.insight_throttle import aggregate_snapshot, should_publish_insight
+from feature_extraction.metrics import (
+    CONSUMER_LAG_MESSAGES,
+    FEATURE_COMPUTE_SECONDS,
+    FEATURE_WINDOWS_TOTAL,
+    PIPELINE_E2E_SECONDS,
+)
 from feature_extraction.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -54,6 +62,13 @@ class _DeviceBuffer:
     sample_rate_hz: float | None = None
     samples: deque[tuple[float, float]] = field(default_factory=deque)  # (timestamp, value)
     next_window_start: float | None = None
+    # week8 Step 1: the `ingest_ts` header off the most recently received
+    # batch for this device — used at window-emit time to compute pipeline
+    # E2E latency. Deliberately "most recent batch", not "first batch in
+    # this window": the guide's definition excludes the 8s window's own
+    # accumulation time (a design latency, not a system bottleneck) from
+    # this number.
+    last_ingest_ts: float | None = None
 
 
 class FeatureExtractionWorker:
@@ -64,6 +79,7 @@ class FeatureExtractionWorker:
         self._buffers: dict[UUID, _DeviceBuffer] = defaultdict(_DeviceBuffer)
         self._active_config: dict | None = None
         self._config_refresh_task: asyncio.Task | None = None
+        self._lag_monitor_task: asyncio.Task | None = None
         # week4-layer2-milestone-guide.md Step 2: last N (window_start,
         # window_end, bpm) per device, for snapshot aggregation, plus when
         # each device last got an InsightRequest, for throttling.
@@ -92,17 +108,24 @@ class FeatureExtractionWorker:
         await self._producer.start()
         await self._store.start()
 
+        # week8 Step 1: no HTTP server of its own, so metrics get a
+        # standalone port rather than piggybacking on FastAPI the way
+        # ingestion/api do.
+        start_http_server(settings.metrics_port)
+
         # Fetch once up front so the very first windows already have a real
         # config if config_service is up, then keep refreshing in the
         # background — the per-message hot path never awaits this.
         self._active_config = await config_client.fetch_active(FEATURE_TYPE_HEART_RATE)
         self._config_refresh_task = asyncio.create_task(self._refresh_config_loop())
+        self._lag_monitor_task = asyncio.create_task(self._lag_monitor_loop())
 
     async def stop(self) -> None:
-        if self._config_refresh_task is not None:
-            self._config_refresh_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._config_refresh_task
+        for task in (self._config_refresh_task, self._lag_monitor_task):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         if self._consumer is not None:
             await self._consumer.stop()
         if self._producer is not None:
@@ -117,6 +140,22 @@ class FeatureExtractionWorker:
             if active is not None:
                 self._active_config = active
 
+    async def _lag_monitor_loop(self) -> None:
+        """week8 Step 1: computed here (highwater - position) rather than via
+        an external exporter — this is the metric the whole "measure lag
+        directly, don't infer it from HTTP latency" decision hinges on: HTTP
+        can stay fast while a slow consumer quietly falls behind, and lag is
+        the only signal that catches that."""
+        assert self._consumer is not None
+        while True:
+            await asyncio.sleep(5.0)
+            for tp in self._consumer.assignment():
+                highwater = self._consumer.highwater(tp)
+                if highwater is None:
+                    continue
+                position = await self._consumer.position(tp)
+                CONSUMER_LAG_MESSAGES.labels(partition=str(tp.partition)).set(highwater - position)
+
     async def run_forever(self) -> None:
         assert self._consumer is not None
         async for message in self._consumer:
@@ -126,15 +165,20 @@ class FeatureExtractionWorker:
             # kafka_producer.py), rather than starting an unrelated one.
             carrier = {k: v.decode("utf-8") for k, v in (message.headers or [])}
             ctx = propagate.extract(carrier)
+            # week8 Step 1: the ingest_ts header ingestion.kafka_producer
+            # stamped on produce — the anchor for pipeline_e2e_seconds.
+            ingest_ts = float(carrier["ingest_ts"]) if "ingest_ts" in carrier else None
             with tracer.start_as_current_span("consume raw-signal", context=ctx):
-                await self._handle_batch(batch)
+                await self._handle_batch(batch, ingest_ts)
 
-    async def _handle_batch(self, batch: SignalBatch) -> None:
+    async def _handle_batch(self, batch: SignalBatch, ingest_ts: float | None = None) -> None:
         if batch.signal_type != SignalType.PPG:
             return  # no feature extractor wired up for this channel yet
 
         buffer = self._buffers[batch.device_id]
         buffer.sample_rate_hz = batch.sample_rate_hz
+        if ingest_ts is not None:
+            buffer.last_ingest_ts = ingest_ts
         dt = 1.0 / batch.sample_rate_hz
         for i, value in enumerate(batch.values):
             buffer.samples.append((batch.start_ts + i * dt, value))
@@ -167,13 +211,15 @@ class FeatureExtractionWorker:
         with tracer.start_as_current_span("compute feature (bandpass+peaks)") as span:
             span.set_attribute("algo_version", algo_version)
             try:
-                bpm = algo_fn(window_values, buffer.sample_rate_hz)
+                with FEATURE_COMPUTE_SECONDS.time():
+                    bpm = algo_fn(window_values, buffer.sample_rate_hz)
             except ValueError as exc:
                 logger.warning(
                     "skipping window [%.3f, %.3f) for %s: %s", window_start, window_end, device_id, exc
                 )
                 span.set_attribute("skipped", True)
                 return
+        FEATURE_WINDOWS_TOTAL.labels(algo_version=algo_version).inc()
 
         feature = Feature(
             device_id=device_id,
@@ -193,6 +239,8 @@ class FeatureExtractionWorker:
             )
         with tracer.start_as_current_span("write features row (postgres)"):
             await self._store.insert(feature, window_end=datetime.fromtimestamp(window_end, tz=UTC))
+        if buffer.last_ingest_ts is not None:
+            PIPELINE_E2E_SECONDS.observe(time.time() - buffer.last_ingest_ts)
 
         await self._maybe_publish_insight_request(device_id, window_start, window_end, bpm)
 

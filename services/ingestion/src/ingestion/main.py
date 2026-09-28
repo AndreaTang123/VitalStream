@@ -18,6 +18,7 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 from vitalstream_common.schemas import SignalBatch, SignalType
 from vitalstream_common.telemetry import configure_tracing
@@ -60,6 +61,10 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="vitalstream-ingestion", lifespan=lifespan)
 FastAPIInstrumentor.instrument_app(app)
+# week8 Step 1: /metrics exposes the standard http_request_duration_seconds
+# histogram (labeled by handler) for free; ingestion.metrics adds the two
+# business-level counters this can't express on its own.
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 
 
 @app.post("/api/v1/devices/{device_id}/signals", status_code=202, dependencies=[Depends(verify_service_token)])

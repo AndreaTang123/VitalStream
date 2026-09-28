@@ -17,6 +17,7 @@ dependencies = [
     "asyncpg>=0.29",
     "pydantic-settings>=2.3",
     "pyyaml>=6.0",
+    "prometheus-client>=0.20",
     "vitalstream-common",
 ]
 

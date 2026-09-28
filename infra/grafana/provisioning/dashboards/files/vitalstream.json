@@ -1,0 +1,122 @@
+{
+  "title": "VitalStream",
+  "uid": "vitalstream-main",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    { "type": "row", "title": "Ingestion", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "id": 100 },
+    {
+      "id": 1, "type": "timeseries", "title": "Requests/sec",
+      "gridPos": { "h": 7, "w": 6, "x": 0, "y": 1 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "sum(rate(http_request_duration_seconds_count{job=\"ingestion\"}[1m]))", "legendFormat": "req/s" }]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Samples/sec",
+      "gridPos": { "h": 7, "w": 6, "x": 6, "y": 1 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "rate(ingest_samples_total[1m])", "legendFormat": "samples/s" }]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "HTTP latency P50 / P95 / P99",
+      "gridPos": { "h": 7, "w": 6, "x": 12, "y": 1 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(http_request_duration_seconds_bucket{job=\"ingestion\"}[1m])))", "legendFormat": "P50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{job=\"ingestion\"}[1m])))", "legendFormat": "P95" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(http_request_duration_seconds_bucket{job=\"ingestion\"}[1m])))", "legendFormat": "P99" }
+      ]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "Error rate",
+      "gridPos": { "h": 7, "w": 6, "x": 18, "y": 1 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "targets": [
+        { "expr": "sum(rate(http_request_duration_seconds_count{job=\"ingestion\", status=~\"5..\"}[1m])) / sum(rate(http_request_duration_seconds_count{job=\"ingestion\"}[1m]))", "legendFormat": "5xx rate" }
+      ]
+    },
+
+    { "type": "row", "title": "Pipeline", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 8 }, "id": 200 },
+    {
+      "id": 5, "type": "timeseries", "title": "Consumer lag (messages)",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 9 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "consumer_lag_messages", "legendFormat": "partition {{partition}}" }]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Pipeline E2E latency P50 / P99 (ingest -> Postgres)",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 9 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(pipeline_e2e_seconds_bucket[1m])))", "legendFormat": "P50" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(pipeline_e2e_seconds_bucket[1m])))", "legendFormat": "P99" }
+      ]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Feature windows/sec by algo_version",
+      "description": "This is the gray-release rollout made visible: two lines whose ratio matches the canary rollout_pct, and one line dropping to zero on rollback.",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 9 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "sum by (algo_version) (rate(feature_windows_total[1m]))", "legendFormat": "{{algo_version}}" }]
+    },
+
+    { "type": "row", "title": "AI", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 16 }, "id": 300 },
+    {
+      "id": 8, "type": "timeseries", "title": "Cache hit rate",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 17 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "min": 0 }, "overrides": [] },
+      "targets": [
+        { "expr": "sum(rate(insight_cache_hits_total[5m])) / (sum(rate(insight_cache_hits_total[5m])) + sum(rate(insight_cache_misses_total[5m])))", "legendFormat": "hit rate" }
+      ]
+    },
+    {
+      "id": 9, "type": "timeseries", "title": "LLM request latency P50 / P99",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 17 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(llm_request_seconds_bucket[5m])))", "legendFormat": "P50" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(llm_request_seconds_bucket[5m])))", "legendFormat": "P99" }
+      ]
+    },
+    {
+      "id": 10, "type": "timeseries", "title": "Cumulative LLM cost (USD)",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 17 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "targets": [{ "expr": "sum by (model, prompt_version) (llm_cost_usd_total)", "legendFormat": "{{model}} / {{prompt_version}}" }]
+    },
+
+    { "type": "row", "title": "Platform", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 }, "id": 400 },
+    {
+      "id": 11, "type": "timeseries", "title": "api 5xx rate",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 25 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "targets": [
+        { "expr": "sum(rate(http_request_duration_seconds_count{job=\"api\", status=~\"5..\"}[1m])) / sum(rate(http_request_duration_seconds_count{job=\"api\"}[1m]))", "legendFormat": "5xx rate" }
+      ]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "RBAC denials/hour by action",
+      "description": "Step 4/8's screenshots (coach denied access to patient B) show up here as a real, queryable spike, not just a one-off audit-log row.",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 25 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "sum by (action) (increase(authz_denied_total[1h]))", "legendFormat": "{{action}}" }]
+    },
+    {
+      "id": 13, "type": "timeseries", "title": "Service up",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 25 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "max": 1, "min": 0 }, "overrides": [] },
+      "targets": [{ "expr": "up", "legendFormat": "{{job}}" }]
+    }
+  ]
+}
